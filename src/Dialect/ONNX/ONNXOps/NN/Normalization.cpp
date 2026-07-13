@@ -292,6 +292,11 @@ mlir::LogicalResult ONNXLNOpShapeHelper<OP_TYPE>::computeShape() {
   }
   return success();
 }
+
+template mlir::LogicalResult
+ONNXLNOpShapeHelper<mlir::ONNXLayerNormalizationOp>::computeShape();
+template mlir::LogicalResult
+ONNXLNOpShapeHelper<mlir::ONNXRMSLayerNormalizationOp>::computeShape();
 } // namespace onnx_mlir
 
 //===----------------------------------------------------------------------===//
