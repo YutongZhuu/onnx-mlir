@@ -5,9 +5,8 @@
 #ifndef MYACCEL_USE_XRT
 
 extern "C" int myaccel_xrt_conv2d_f32(const float *, const float *,
-    const float *, float *, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int64_t, int64_t, int64_t, int64_t, int64_t) {
+    const float *, float *, int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, int, int) {
   fprintf(stderr, "MYACCEL: XRT support not compiled in\n");
   return 0;
 }
@@ -55,22 +54,20 @@ XrtContext *getContext() {
 } // namespace
 
 extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
-    const float *bias, float *y, int64_t n_size, int64_t c_size,
-    int64_t h_size, int64_t input_w_size, int64_t m_size, int64_t kh_size,
-    int64_t kw_size, int64_t oh_size, int64_t ow_size, int64_t dilation_h,
-    int64_t dilation_w, int64_t c_per_group, int64_t group,
-    int64_t pad_left, int64_t pad_top, int64_t stride_h, int64_t stride_w,
-    int64_t has_bias) {
+    const float *bias, float *y, int n_size, int c_size, int h_size,
+    int input_w_size, int m_size, int kh_size, int kw_size, int oh_size,
+    int ow_size, int dilation_h, int dilation_w, int c_per_group, int group,
+    int pad_left, int pad_top, int stride_h, int stride_w, int has_bias) {
   try {
       
     XrtContext *ctx = getContext();
     if (!ctx)
       return 0;
       
-    size_t xBytes = n_size * c_size * h_size * input_w_size * sizeof(float);
-    size_t wBytes = m_size * c_per_group * kh_size * kw_size * sizeof(float);
-    size_t bBytes = (has_bias ? m_size : 1) * sizeof(float);
-    size_t yBytes = n_size * m_size * oh_size * ow_size * sizeof(float);
+    size_t xBytes = (size_t)n_size * c_size * h_size * input_w_size * sizeof(float);
+    size_t wBytes = (size_t)m_size * c_per_group * kh_size * kw_size * sizeof(float);
+    size_t bBytes = (size_t)(has_bias ? m_size : 1) * sizeof(float);
+    size_t yBytes = (size_t)n_size * m_size * oh_size * ow_size * sizeof(float);
     
     xrt::bo xBo(ctx->device, xBytes, ctx->kernel.group_id(0));
     xrt::bo wBo(ctx->device, wBytes, ctx->kernel.group_id(1));

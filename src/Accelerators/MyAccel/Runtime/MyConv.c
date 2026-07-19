@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -10,9 +11,20 @@ uint64_t OMInitCompatibleAccelMyAccel(uint64_t version) {
   return 1;
 }
 
+static int product_fits_uint32(int64_t a, int64_t b, int64_t c, int64_t d) {
+  if (a <= 0 || b <= 0 || c <= 0 || d <= 0)
+    return 0;
+  return a <= UINT32_MAX / b && a * b <= UINT32_MAX / c &&
+         a * b * c <= UINT32_MAX / d;
+}
+
+static int value_fits_int(int64_t value) {
+  return value >= 0 && value <= INT_MAX;
+}
+
 static int check_support(const int64_t *xs, const int64_t *ws,
     const int64_t *ys, int64_t dh, int64_t dw, int64_t group, int64_t sh,
-    int64_t sw) {
+    int64_t sw, int64_t padLeft, int64_t padTop) {
   if (getenv("MYACCEL_FORCE_CPU"))
     return 0;
   if (dh != 1 || dw != 1 || group != 1 || sh <= 0 || sw <= 0) 
@@ -22,6 +34,19 @@ static int check_support(const int64_t *xs, const int64_t *ws,
       ws[0] <= 0 || ws[1] <= 0 || ws[2] <= 0 || ws[3] <= 0 ||
       ys[0] <= 0 || ys[1] <= 0 || ys[2] <= 0 || ys[3] <= 0)
   // More invalid metadata
+    return 0;
+  if (!value_fits_int(dh) || !value_fits_int(dw) || !value_fits_int(group) ||
+      !value_fits_int(sh) || !value_fits_int(sw) ||
+      !value_fits_int(padLeft) || !value_fits_int(padTop))
+    return 0;
+  for (int i = 0; i < 4; ++i) {
+    if (!value_fits_int(xs[i]) || !value_fits_int(ws[i]) ||
+        !value_fits_int(ys[i]))
+      return 0;
+  }
+  if (!product_fits_uint32(xs[0], xs[1], xs[2], xs[3]) ||
+      !product_fits_uint32(ws[0], ws[1], ws[2], ws[3]) ||
+      !product_fits_uint32(ys[0], ys[1], ys[2], ys[3]))
     return 0;
   return xs[1] == ws[1] && ys[0] == xs[0] && ys[1] == ws[0];
 }
@@ -76,16 +101,17 @@ void my_conv_f32(OMTensor *yTensor, const OMTensor *xTensor,
   const int64_t ohSize = ys[2], owSize = ys[3];
 
   fprintf(stderr, "MYACCEL: my_conv_f32 invoked\n");
-  if (!check_support(xs, ws, ys, dh, dw, group, sh, sw)) {
+  if (!check_support(xs, ws, ys, dh, dw, group, sh, sw, padLeft, padTop)) {
     fprintf(stderr, "MYACCEL: unsupported conv, falling back to CPU convolution\n");
     my_conv_f32_cpu_fallback(
         y, x, w, b, xs, ws, ys, dh, dw, group, padLeft, padTop, sh, sw);
     return;
   }
 
-  if (myaccel_xrt_conv2d_f32(x, w, b, y, nSize, cSize, hSize, wSize, mSize,
-          khSize, kwSize, ohSize, owSize, dh, dw, cPerGroup, group, padLeft,
-          padTop, sh, sw, bTensor != 0)) {
+  if (myaccel_xrt_conv2d_f32(x, w, b, y, (int)nSize, (int)cSize, (int)hSize,
+          (int)wSize, (int)mSize, (int)khSize, (int)kwSize, (int)ohSize,
+          (int)owSize, (int)dh, (int)dw, (int)cPerGroup, (int)group,
+          (int)padLeft, (int)padTop, (int)sh, (int)sw, bTensor != 0)) {
     return;
   }
 
