@@ -13,6 +13,7 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *, const float *,
 
 #else
 
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <string>
@@ -24,6 +25,11 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *, const float *,
 // real XRT implementation goes here
 
 namespace {
+
+double elapsedSeconds(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+      .count();
+}
 
 struct XrtContext {
   xrt::device device;
@@ -47,7 +53,11 @@ XrtContext *getContext() {
     return nullptr;
   }
 
+  fprintf(stderr, "MYACCEL: loading xclbin: %s\n", xclbin);
+  const auto start = std::chrono::steady_clock::now();
   g_ctx = std::make_unique<XrtContext>(xclbin);
+  fprintf(stderr, "MYACCEL: loaded xclbin and opened conv2d_kernel in %.6f s\n",
+      elapsedSeconds(start));
   return g_ctx.get();
 }
 
@@ -68,31 +78,51 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
     size_t wBytes = (size_t)m_size * c_per_group * kh_size * kw_size * sizeof(float);
     size_t bBytes = (size_t)(has_bias ? m_size : 1) * sizeof(float);
     size_t yBytes = (size_t)n_size * m_size * oh_size * ow_size * sizeof(float);
+
+    fprintf(stderr,
+        "MYACCEL: XRT launch preparing bytes={x:%zu,w:%zu,b:%zu,y:%zu}\n",
+        xBytes, wBytes, bBytes, yBytes);
     
+    const auto allocStart = std::chrono::steady_clock::now();
     xrt::bo xBo(ctx->device, xBytes, ctx->kernel.group_id(0));
     xrt::bo wBo(ctx->device, wBytes, ctx->kernel.group_id(1));
     xrt::bo bBo(ctx->device, bBytes, ctx->kernel.group_id(2));
     xrt::bo yBo(ctx->device, yBytes, ctx->kernel.group_id(3));
+    fprintf(stderr, "MYACCEL: XRT BO allocation complete in %.6f s\n",
+        elapsedSeconds(allocStart));
     
+    const auto writeStart = std::chrono::steady_clock::now();
     xBo.write(x, xBytes, 0);
     wBo.write(weight, wBytes, 0);
     
     float dummyBias = 0.0f;
     bBo.write(has_bias ? bias : &dummyBias, bBytes, 0);
+    fprintf(stderr, "MYACCEL: XRT host writes complete in %.6f s\n",
+        elapsedSeconds(writeStart));
     
+    const auto syncToStart = std::chrono::steady_clock::now();
     xBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     wBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     bBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    fprintf(stderr, "MYACCEL: XRT input sync complete in %.6f s\n",
+        elapsedSeconds(syncToStart));
     
+    const auto launchStart = std::chrono::steady_clock::now();
+    fprintf(stderr, "MYACCEL: XRT kernel launch start\n");
     auto run = ctx->kernel(xBo, wBo, bBo, yBo,
       n_size, c_size, h_size, input_w_size,
       m_size, kh_size, kw_size, oh_size, ow_size,
       dilation_h, dilation_w, c_per_group, group,
       pad_left, pad_top, stride_h, stride_w, has_bias);
     run.wait();
+    fprintf(stderr, "MYACCEL: XRT kernel wait complete in %.6f s\n",
+        elapsedSeconds(launchStart));
     
+    const auto readStart = std::chrono::steady_clock::now();
     yBo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     yBo.read(y, yBytes, 0);
+    fprintf(stderr, "MYACCEL: XRT output sync/read complete in %.6f s\n",
+        elapsedSeconds(readStart));
 
     return 1;
   } catch (const std::exception &e) {
