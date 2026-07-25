@@ -1,4 +1,7 @@
 #include <algorithm>
+#include <chrono>
+#include <csignal>
+#include <cstring>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -6,6 +9,9 @@
 #include <exception>
 #include <string>
 #include <vector>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -27,6 +33,71 @@ struct ConvCase {
   int strideH;
   int strideW;
 };
+
+void timeoutHandler(int) {
+  const char msg[] =
+      "FAIL timeout: host_xrt_conv_test exceeded HOST_XRT_TIMEOUT_SEC\n";
+  (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+  _exit(124);
+}
+
+unsigned int envUInt(const char *name, unsigned int fallback) {
+  const char *value = std::getenv(name);
+  if (!value || !*value)
+    return fallback;
+  char *end = nullptr;
+  const unsigned long parsed = std::strtoul(value, &end, 10);
+  if (!end || *end != '\0' || parsed > 0xffffffffUL) {
+    std::fprintf(stderr, "warning: ignoring invalid %s=%s\n", name, value);
+    return fallback;
+  }
+  return (unsigned int)parsed;
+}
+
+const char *stateName(ert_cmd_state state) {
+  switch (state) {
+  case ERT_CMD_STATE_NEW:
+    return "NEW";
+  case ERT_CMD_STATE_QUEUED:
+    return "QUEUED";
+  case ERT_CMD_STATE_RUNNING:
+    return "RUNNING";
+  case ERT_CMD_STATE_COMPLETED:
+    return "COMPLETED";
+  case ERT_CMD_STATE_ERROR:
+    return "ERROR";
+  case ERT_CMD_STATE_ABORT:
+    return "ABORT";
+  case ERT_CMD_STATE_SUBMITTED:
+    return "SUBMITTED";
+  case ERT_CMD_STATE_TIMEOUT:
+    return "TIMEOUT";
+  case ERT_CMD_STATE_NORESPONSE:
+    return "NORESPONSE";
+  case ERT_CMD_STATE_SKERROR:
+    return "SKERROR";
+  case ERT_CMD_STATE_SKCRASHED:
+    return "SKCRASHED";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+void step(const char *message) {
+  std::printf("[host-xrt-test] %s\n", message);
+  std::fflush(stdout);
+}
+
+bool fileExists(const char *path) {
+  struct stat st;
+  return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+bool deviceNodeExists() {
+  return access("/dev/dri/renderD128", R_OK | W_OK) == 0 ||
+         access("/dev/zocl", R_OK | W_OK) == 0 ||
+         access("/dev/xocl", R_OK | W_OK) == 0;
+}
 
 std::vector<float> makeSequence(size_t elems, float scale, float offset) {
   std::vector<float> values(elems);
@@ -67,7 +138,8 @@ void referenceConv(const ConvCase &tc, const std::vector<float> &x,
         }
 }
 
-bool runCase(xrt::device &device, xrt::kernel &kernel, const ConvCase &tc) {
+bool runCase(xrt::device &device, xrt::kernel &kernel, const ConvCase &tc,
+    unsigned int runTimeoutMs) {
   const int oh = (tc.h + 2 * tc.padTop - tc.kh) / tc.strideH + 1;
   const int ow = (tc.w + 2 * tc.padLeft - tc.kw) / tc.strideW + 1;
   const size_t xElems = (size_t)tc.n * tc.c * tc.h * tc.w;
@@ -96,16 +168,20 @@ bool runCase(xrt::device &device, xrt::kernel &kernel, const ConvCase &tc) {
     referenceConv(tc, x, weight, bias, expected);
   }
 
-  std::printf("case=%s shape x=[%d,%d,%d,%d] w=[%d,%d,%d,%d] "
+  std::printf("[host-xrt-test] case=%s shape x=[%d,%d,%d,%d] "
+              "w=[%d,%d,%d,%d] "
               "y=[%d,%d,%d,%d] bytes={x:%zu,w:%zu,b:%zu,y:%zu}\n",
       tc.name, tc.n, tc.c, tc.h, tc.w, tc.m, tc.c, tc.kh, tc.kw, tc.n, tc.m,
       oh, ow, xBytes, wBytes, bBytes, yBytes);
+  std::fflush(stdout);
 
+  step("allocating XRT buffer objects");
   xrt::bo xBo(device, xBytes, kernel.group_id(0));
   xrt::bo wBo(device, wBytes, kernel.group_id(1));
   xrt::bo bBo(device, bBytes, kernel.group_id(2));
   xrt::bo yBo(device, yBytes, kernel.group_id(3));
 
+  step("writing and syncing inputs to device");
   xBo.write(x.data(), xBytes, 0);
   wBo.write(weight.data(), wBytes, 0);
   bBo.write(bias.data(), bBytes, 0);
@@ -113,11 +189,32 @@ bool runCase(xrt::device &device, xrt::kernel &kernel, const ConvCase &tc) {
   wBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   bBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
+  step("launching kernel");
   auto run = kernel(xBo, wBo, bBo, yBo, tc.n, tc.c, tc.h, tc.w, tc.m, tc.kh,
       tc.kw, oh, ow, 1, 1, tc.c, 1, tc.padLeft, tc.padTop, tc.strideH,
       tc.strideW, 1);
-  run.wait();
+  std::printf("[host-xrt-test] waiting for kernel, timeout_ms=%u\n",
+      runTimeoutMs);
+  std::fflush(stdout);
+  ert_cmd_state state = run.wait(runTimeoutMs);
+  std::printf("[host-xrt-test] kernel wait returned state=%s(%d)\n",
+      stateName(state), (int)state);
+  std::fflush(stdout);
+  if (state == ERT_CMD_STATE_TIMEOUT) {
+    std::fprintf(stderr, "FAIL case=%s timed out; aborting run\n", tc.name);
+    std::fflush(stderr);
+    ert_cmd_state abortState = run.abort();
+    std::fprintf(stderr, "FAIL case=%s abort returned state=%s(%d)\n", tc.name,
+        stateName(abortState), (int)abortState);
+    return false;
+  }
+  if (state != ERT_CMD_STATE_COMPLETED) {
+    std::fprintf(stderr, "FAIL case=%s kernel returned state=%s(%d)\n", tc.name,
+        stateName(state), (int)state);
+    return false;
+  }
 
+  step("syncing output from device");
   yBo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   yBo.read(actual.data(), yBytes, 0);
 
@@ -149,41 +246,75 @@ bool runCase(xrt::device &device, xrt::kernel &kernel, const ConvCase &tc) {
 }
 
 void usage(const char *argv0) {
-  std::fprintf(stderr, "usage: %s <conv2d_kernel.xclbin> [--medium|--all]\n",
+  std::fprintf(stderr,
+      "usage: %s <conv2d_kernel.xclbin> [--medium|--all|--probe-only]\n"
+      "env: HOST_XRT_TIMEOUT_SEC=30 HOST_XRT_RUN_TIMEOUT_MS=5000\n",
       argv0);
 }
 
 } // namespace
 
 int main(int argc, char **argv) {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  std::setvbuf(stderr, nullptr, _IONBF, 0);
+
   if (argc < 2 || argc > 3) {
     usage(argv[0]);
     return 2;
   }
 
   const std::string mode = argc == 3 ? argv[2] : "";
-  if (!mode.empty() && mode != "--medium" && mode != "--all") {
+  if (!mode.empty() && mode != "--medium" && mode != "--all" &&
+      mode != "--probe-only") {
     usage(argv[0]);
     return 2;
   }
 
+  const unsigned int timeoutSec = envUInt("HOST_XRT_TIMEOUT_SEC", 30);
+  const unsigned int runTimeoutMs = envUInt("HOST_XRT_RUN_TIMEOUT_MS", 5000);
+  std::signal(SIGALRM, timeoutHandler);
+  if (timeoutSec > 0)
+    alarm(timeoutSec);
+
+  if (!fileExists(argv[1])) {
+    std::fprintf(stderr, "FAIL preflight: xclbin does not exist: %s\n",
+        argv[1]);
+    return 2;
+  }
+  if (!deviceNodeExists()) {
+    std::fprintf(stderr,
+        "FAIL preflight: no usable XRT device node found "
+        "(/dev/dri/renderD128, /dev/zocl, or /dev/xocl)\n");
+    return 2;
+  }
+
   try {
+    step("opening XRT device 0");
     xrt::device device(0);
+    step("loading xclbin");
     xrt::uuid uuid = device.load_xclbin(argv[1]);
+    step("opening kernel conv2d_kernel");
     xrt::kernel kernel(device, uuid, "conv2d_kernel");
+    step("XRT setup completed");
+    if (mode == "--probe-only") {
+      step("probe-only requested; exiting before kernel launch");
+      alarm(0);
+      return 0;
+    }
 
     const ConvCase tiny = {"tiny", 1, 1, 4, 4, 1, 3, 3, 0, 0, 1, 1};
     const ConvCase medium = {"medium", 1, 4, 16, 16, 4, 3, 3, 0, 0, 1, 1};
 
     bool ok = true;
     if (mode == "--medium") {
-      ok = runCase(device, kernel, medium);
+      ok = runCase(device, kernel, medium, runTimeoutMs);
     } else {
-      ok = runCase(device, kernel, tiny);
+      ok = runCase(device, kernel, tiny, runTimeoutMs);
       if (ok && mode == "--all")
-        ok = runCase(device, kernel, medium);
+        ok = runCase(device, kernel, medium, runTimeoutMs);
     }
 
+    alarm(0);
     return ok ? 0 : 1;
   } catch (const std::exception &e) {
     std::fprintf(stderr, "error: %s\n", e.what());
