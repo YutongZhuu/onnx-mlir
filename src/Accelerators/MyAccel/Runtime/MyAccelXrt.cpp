@@ -34,11 +34,13 @@ double elapsedSeconds(std::chrono::steady_clock::time_point start) {
 struct XrtContext {
   xrt::device device;
   xrt::uuid uuid;
-  xrt::kernel kernel;
+  xrt::kernel conv1x1Kernel;
+  xrt::kernel conv3x3Kernel;
 
   explicit XrtContext(const char *xclbin)
       : device(0), uuid(device.load_xclbin(xclbin)),
-        kernel(device, uuid, "conv2d_kernel") {}
+        conv1x1Kernel(device, uuid, "conv1x1_kernel"),
+        conv3x3Kernel(device, uuid, "conv3x3_kernel") {}
 };
 
 std::unique_ptr<XrtContext> g_ctx;
@@ -73,7 +75,18 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
     XrtContext *ctx = getContext();
     if (!ctx)
       return 0;
-      
+    if (dilation_h != 1 || dilation_w != 1 || group != 1 ||
+        c_per_group != c_size)
+      return 0;
+
+    xrt::kernel *kernel = nullptr;
+    if (kh_size == 1 && kw_size == 1)
+      kernel = &ctx->conv1x1Kernel;
+    else if (kh_size == 3 && kw_size == 3)
+      kernel = &ctx->conv3x3Kernel;
+    else
+      return 0;
+
     size_t xBytes = (size_t)n_size * c_size * h_size * input_w_size * sizeof(float);
     size_t wBytes = (size_t)m_size * c_per_group * kh_size * kw_size * sizeof(float);
     size_t bBytes = (size_t)(has_bias ? m_size : 1) * sizeof(float);
@@ -84,10 +97,10 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
         xBytes, wBytes, bBytes, yBytes);
     
     const auto allocStart = std::chrono::steady_clock::now();
-    xrt::bo xBo(ctx->device, xBytes, ctx->kernel.group_id(0));
-    xrt::bo wBo(ctx->device, wBytes, ctx->kernel.group_id(1));
-    xrt::bo bBo(ctx->device, bBytes, ctx->kernel.group_id(2));
-    xrt::bo yBo(ctx->device, yBytes, ctx->kernel.group_id(3));
+    xrt::bo xBo(ctx->device, xBytes, kernel->group_id(0));
+    xrt::bo wBo(ctx->device, wBytes, kernel->group_id(1));
+    xrt::bo bBo(ctx->device, bBytes, kernel->group_id(2));
+    xrt::bo yBo(ctx->device, yBytes, kernel->group_id(3));
     fprintf(stderr, "MYACCEL: XRT BO allocation complete in %.6f s\n",
         elapsedSeconds(allocStart));
     
@@ -109,12 +122,16 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
     
     const auto launchStart = std::chrono::steady_clock::now();
     fprintf(stderr, "MYACCEL: XRT kernel launch start\n");
-    auto run = ctx->kernel(xBo, wBo, bBo, yBo,
-      n_size, c_size, h_size, input_w_size,
-      m_size, kh_size, kw_size, oh_size, ow_size,
-      dilation_h, dilation_w, c_per_group, group,
-      pad_left, pad_top, stride_h, stride_w, has_bias);
-    run.wait();
+    if (kh_size == 1) {
+      auto run = (*kernel)(xBo, wBo, bBo, yBo, n_size, c_size, h_size,
+          input_w_size, m_size, has_bias);
+      run.wait();
+    } else {
+      auto run = (*kernel)(xBo, wBo, bBo, yBo, n_size, c_size, h_size,
+          input_w_size, m_size, oh_size, ow_size, pad_left, pad_top,
+          stride_h, stride_w, has_bias);
+      run.wait();
+    }
     fprintf(stderr, "MYACCEL: XRT kernel wait complete in %.6f s\n",
         elapsedSeconds(launchStart));
     

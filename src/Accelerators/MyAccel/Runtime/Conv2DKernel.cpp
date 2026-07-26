@@ -82,7 +82,9 @@ void conv2d_kernel(
           float sum = has_bias ? bias[m] : 0.0f;
           for (int cg = 0; cg < c_per_group; ++cg) {
             for (int kh = 0; kh < kh_size; ++kh) {
+            KwLoop:
               for (int kw = 0; kw < kw_size; ++kw) {
+#pragma HLS PIPELINE II = 1
                 const int ih = oh * stride_h + kh * dilation_h - pad_top;
                 const int iw = ow * stride_w + kw * dilation_w - pad_left;
                 if (ih < 0 || ih >= h_size || iw < 0 ||
