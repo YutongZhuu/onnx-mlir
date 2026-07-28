@@ -10,6 +10,8 @@
 #include <arm_neon.h>
 #endif
 
+#include "Conv1x1Kernel.h"
+#include "Conv3x3Kernel.h"
 #include "MyAccelXrt.h"
 #include "onnx-mlir/Runtime/OMTensor.h"
 
@@ -105,6 +107,30 @@ static int check_support(const int64_t *xs, const int64_t *ws,
   }
   if (!(xs[1] == ws[1] && ys[0] == xs[0] && ys[1] == ws[0])) {
     set_reason(reason, reasonSize, "inconsistent Conv tensor shapes");
+    return 0;
+  }
+
+  const int is1x1 = ws[2] == 1 && ws[3] == 1;
+  const int is3x3 = ws[2] == 3 && ws[3] == 3;
+  if (!is1x1 && !is3x3) {
+    set_reason(reason, reasonSize, "only 1x1 and 3x3 kernels are supported");
+    return 0;
+  }
+
+  if (is1x1 &&
+      (xs[1] > MYACCEL_CONV1X1_MAX_INPUT_CHANNELS || sh != 1 || sw != 1 ||
+          padLeft != 0 || padTop != 0 || ys[2] != xs[2] ||
+          ys[3] != xs[3])) {
+    set_reason(reason, reasonSize,
+        "1x1 convolution exceeds channel limit or requires padding/stride");
+    return 0;
+  }
+  if (is3x3 &&
+      (xs[1] > MYACCEL_CONV3X3_MAX_INPUT_CHANNELS ||
+          sh > MYACCEL_CONV3X3_MAX_STRIDE ||
+          sw > MYACCEL_CONV3X3_MAX_STRIDE)) {
+    set_reason(reason, reasonSize,
+        "3x3 convolution exceeds channel or stride limit");
     return 0;
   }
 

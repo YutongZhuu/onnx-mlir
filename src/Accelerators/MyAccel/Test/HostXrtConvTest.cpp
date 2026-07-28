@@ -1,12 +1,13 @@
 #include <algorithm>
 #include <chrono>
 #include <csignal>
-#include <cstring>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
-#include <exception>
+#include <cstring>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -19,25 +20,12 @@
 
 namespace {
 
-struct ConvCase {
-  const char *name;
-  int n;
-  int c;
-  int h;
-  int w;
-  int m;
-  int kh;
-  int kw;
-  int padTop;
-  int padLeft;
-  int strideH;
-  int strideW;
-};
+using Clock = std::chrono::steady_clock;
 
 void timeoutHandler(int) {
-  const char msg[] =
+  const char message[] =
       "FAIL timeout: host_xrt_conv_test exceeded HOST_XRT_TIMEOUT_SEC\n";
-  (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+  (void)!write(STDERR_FILENO, message, sizeof(message) - 1);
   _exit(124);
 }
 
@@ -83,14 +71,9 @@ const char *stateName(ert_cmd_state state) {
   }
 }
 
-void step(const char *message) {
-  std::printf("[host-xrt-test] %s\n", message);
-  std::fflush(stdout);
-}
-
 bool fileExists(const char *path) {
-  struct stat st;
-  return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+  struct stat status;
+  return stat(path, &status) == 0 && S_ISREG(status.st_mode);
 }
 
 bool deviceNodeExists() {
@@ -99,157 +82,159 @@ bool deviceNodeExists() {
          access("/dev/xocl", R_OK | W_OK) == 0;
 }
 
-std::vector<float> makeSequence(size_t elems, float scale, float offset) {
-  std::vector<float> values(elems);
-  for (size_t i = 0; i < elems; ++i)
-    values[i] = (float)((int)(i % 17) - 8) * scale + offset;
-  return values;
+struct ConvCase {
+  const char *name;
+  int n;
+  int c;
+  int h;
+  int w;
+  int m;
+  int kernel;
+  int pad;
+  int stride;
+  bool hasBias;
+};
+
+double milliseconds(Clock::time_point start, Clock::time_point end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-void referenceConv(const ConvCase &tc, const std::vector<float> &x,
+void fillRandom(std::vector<float> &values, std::mt19937 &generator) {
+  std::uniform_real_distribution<float> distribution(-0.5f, 0.5f);
+  for (float &value : values)
+    value = distribution(generator);
+}
+
+void referenceConv(const ConvCase &test, const std::vector<float> &x,
     const std::vector<float> &weight, const std::vector<float> &bias,
-    std::vector<float> &y) {
-  const int oh = (tc.h + 2 * tc.padTop - tc.kh) / tc.strideH + 1;
-  const int ow = (tc.w + 2 * tc.padLeft - tc.kw) / tc.strideW + 1;
-
-  for (int n = 0; n < tc.n; ++n)
-    for (int m = 0; m < tc.m; ++m)
-      for (int outH = 0; outH < oh; ++outH)
-        for (int outW = 0; outW < ow; ++outW) {
-          float sum = bias[m];
-          for (int c = 0; c < tc.c; ++c)
-            for (int kh = 0; kh < tc.kh; ++kh)
-              for (int kw = 0; kw < tc.kw; ++kw) {
-                const int inH = outH * tc.strideH + kh - tc.padTop;
-                const int inW = outW * tc.strideW + kw - tc.padLeft;
-                if (inH < 0 || inH >= tc.h || inW < 0 || inW >= tc.w)
+    std::vector<float> &y, int ohSize, int owSize) {
+  for (int n = 0; n < test.n; ++n)
+    for (int m = 0; m < test.m; ++m)
+      for (int oh = 0; oh < ohSize; ++oh)
+        for (int ow = 0; ow < owSize; ++ow) {
+          float sum = test.hasBias ? bias[m] : 0.0f;
+          for (int c = 0; c < test.c; ++c)
+            for (int kh = 0; kh < test.kernel; ++kh)
+              for (int kw = 0; kw < test.kernel; ++kw) {
+                const int ih = oh * test.stride + kh - test.pad;
+                const int iw = ow * test.stride + kw - test.pad;
+                if (ih < 0 || ih >= test.h || iw < 0 || iw >= test.w)
                   continue;
-
                 const size_t xIndex =
-                    ((size_t)(n * tc.c + c) * tc.h + inH) * tc.w + inW;
-                const size_t wIndex =
-                    ((size_t)(m * tc.c + c) * tc.kh + kh) * tc.kw + kw;
-                sum += x[xIndex] * weight[wIndex];
+                    ((size_t)n * test.c + c) * test.h * test.w +
+                    (size_t)ih * test.w + iw;
+                const size_t weightIndex =
+                    (((size_t)m * test.c + c) * test.kernel + kh) *
+                        test.kernel +
+                    kw;
+                sum += x[xIndex] * weight[weightIndex];
               }
-
           const size_t yIndex =
-              ((size_t)(n * tc.m + m) * oh + outH) * ow + outW;
+              ((size_t)n * test.m + m) * ohSize * owSize +
+              (size_t)oh * owSize + ow;
           y[yIndex] = sum;
         }
 }
 
-bool runCase(xrt::device &device, xrt::kernel &kernel, const ConvCase &tc,
+bool runCase(xrt::device &device, xrt::kernel &kernel,
+    const ConvCase &test, std::mt19937 &generator,
     unsigned int runTimeoutMs) {
-  const int oh = (tc.h + 2 * tc.padTop - tc.kh) / tc.strideH + 1;
-  const int ow = (tc.w + 2 * tc.padLeft - tc.kw) / tc.strideW + 1;
-  const size_t xElems = (size_t)tc.n * tc.c * tc.h * tc.w;
-  const size_t wElems = (size_t)tc.m * tc.c * tc.kh * tc.kw;
-  const size_t bElems = (size_t)tc.m;
-  const size_t yElems = (size_t)tc.n * tc.m * oh * ow;
-  const size_t xBytes = xElems * sizeof(float);
-  const size_t wBytes = wElems * sizeof(float);
-  const size_t bBytes = bElems * sizeof(float);
-  const size_t yBytes = yElems * sizeof(float);
+  const int ohSize =
+      (test.h + 2 * test.pad - test.kernel) / test.stride + 1;
+  const int owSize =
+      (test.w + 2 * test.pad - test.kernel) / test.stride + 1;
+  const size_t xCount = (size_t)test.n * test.c * test.h * test.w;
+  const size_t weightCount =
+      (size_t)test.m * test.c * test.kernel * test.kernel;
+  const size_t biasCount = test.hasBias ? (size_t)test.m : 1;
+  const size_t yCount = (size_t)test.n * test.m * ohSize * owSize;
+  const size_t xBytes = xCount * sizeof(float);
+  const size_t weightBytes = weightCount * sizeof(float);
+  const size_t biasBytes = biasCount * sizeof(float);
+  const size_t yBytes = yCount * sizeof(float);
 
-  std::vector<float> x = makeSequence(xElems, 0.125f, 0.25f);
-  std::vector<float> weight = makeSequence(wElems, 0.0625f, -0.125f);
-  std::vector<float> bias = makeSequence(bElems, 0.25f, 0.5f);
-  std::vector<float> expected(yElems, 0.0f);
-  std::vector<float> actual(yElems, 0.0f);
-  referenceConv(tc, x, weight, bias, expected);
+  std::vector<float> x(xCount);
+  std::vector<float> weight(weightCount);
+  std::vector<float> bias(test.m);
+  std::vector<float> expected(yCount);
+  std::vector<float> actual(yCount);
+  fillRandom(x, generator);
+  fillRandom(weight, generator);
+  fillRandom(bias, generator);
+  referenceConv(test, x, weight, bias, expected, ohSize, owSize);
+  const float dummyBias = 0.0f;
 
-  if (std::string(tc.name) == "tiny") {
-    std::fill(x.begin(), x.end(), 0.0f);
-    for (size_t i = 0; i < x.size(); ++i)
-      x[i] = (float)(i + 1);
-    std::fill(weight.begin(), weight.end(), 1.0f);
-    std::fill(bias.begin(), bias.end(), 0.5f);
-    std::fill(expected.begin(), expected.end(), 0.0f);
-    referenceConv(tc, x, weight, bias, expected);
-  }
-
-  std::printf("[host-xrt-test] case=%s shape x=[%d,%d,%d,%d] "
-              "w=[%d,%d,%d,%d] "
-              "y=[%d,%d,%d,%d] bytes={x:%zu,w:%zu,b:%zu,y:%zu}\n",
-      tc.name, tc.n, tc.c, tc.h, tc.w, tc.m, tc.c, tc.kh, tc.kw, tc.n, tc.m,
-      oh, ow, xBytes, wBytes, bBytes, yBytes);
-  std::fflush(stdout);
-
-  step("allocating XRT buffer objects");
+  const auto allocationStart = Clock::now();
   xrt::bo xBo(device, xBytes, kernel.group_id(0));
-  xrt::bo wBo(device, wBytes, kernel.group_id(1));
-  xrt::bo bBo(device, bBytes, kernel.group_id(2));
+  xrt::bo weightBo(device, weightBytes, kernel.group_id(1));
+  xrt::bo biasBo(device, biasBytes, kernel.group_id(2));
   xrt::bo yBo(device, yBytes, kernel.group_id(3));
+  const auto allocationEnd = Clock::now();
 
-  step("writing and syncing inputs to device");
+  const auto writeStart = Clock::now();
   xBo.write(x.data(), xBytes, 0);
-  wBo.write(weight.data(), wBytes, 0);
-  bBo.write(bias.data(), bBytes, 0);
-  xBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  wBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  weightBo.write(weight.data(), weightBytes, 0);
+  biasBo.write(test.hasBias ? bias.data() : &dummyBias, biasBytes, 0);
+  const auto writeEnd = Clock::now();
 
-  step("launching kernel");
-  auto run = kernel(xBo, wBo, bBo, yBo, tc.n, tc.c, tc.h, tc.w, tc.m, tc.kh,
-      tc.kw, oh, ow, 1, 1, tc.c, 1, tc.padLeft, tc.padTop, tc.strideH,
-      tc.strideW, 1);
-  std::printf("[host-xrt-test] waiting for kernel, timeout_ms=%u\n",
-      runTimeoutMs);
-  std::fflush(stdout);
-  ert_cmd_state state = run.wait(runTimeoutMs);
-  std::printf("[host-xrt-test] kernel wait returned state=%s(%d)\n",
-      stateName(state), (int)state);
-  std::fflush(stdout);
-  if (state == ERT_CMD_STATE_TIMEOUT) {
-    std::fprintf(stderr, "FAIL case=%s timed out; aborting run\n", tc.name);
-    std::fflush(stderr);
-    ert_cmd_state abortState = run.abort();
-    std::fprintf(stderr, "FAIL case=%s abort returned state=%s(%d)\n", tc.name,
-        stateName(abortState), (int)abortState);
-    return false;
+  const auto h2dStart = Clock::now();
+  xBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  weightBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  biasBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  const auto h2dEnd = Clock::now();
+
+  const auto waitStart = Clock::now();
+  ert_cmd_state state;
+  if (test.kernel == 1) {
+    auto run = kernel(xBo, weightBo, biasBo, yBo, test.n, test.c, test.h,
+        test.w, test.m, test.hasBias);
+    state = run.wait(runTimeoutMs);
+    if (state == ERT_CMD_STATE_TIMEOUT)
+      (void)run.abort();
+  } else {
+    auto run = kernel(xBo, weightBo, biasBo, yBo, test.n, test.c, test.h,
+        test.w, test.m, ohSize, owSize, test.pad, test.pad, test.stride,
+        test.stride, test.hasBias);
+    state = run.wait(runTimeoutMs);
+    if (state == ERT_CMD_STATE_TIMEOUT)
+      (void)run.abort();
   }
+  const auto waitEnd = Clock::now();
   if (state != ERT_CMD_STATE_COMPLETED) {
-    std::fprintf(stderr, "FAIL case=%s kernel returned state=%s(%d)\n", tc.name,
+    std::fprintf(stderr, "FAIL %s kernel returned state=%s(%d)\n", test.name,
         stateName(state), (int)state);
     return false;
   }
 
-  step("syncing output from device");
+  const auto d2hStart = Clock::now();
   yBo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  const auto d2hEnd = Clock::now();
+  const auto readStart = Clock::now();
   yBo.read(actual.data(), yBytes, 0);
+  const auto readEnd = Clock::now();
 
-  if (std::string(tc.name) == "tiny") {
-    for (size_t i = 0; i < yElems; ++i)
-      std::printf("  y[%zu] = %.1f (expected %.1f)\n", i, actual[i],
-          expected[i]);
-  }
-
-  float maxAbsDiff = 0.0f;
-  size_t maxIndex = 0;
-  for (size_t i = 0; i < yElems; ++i) {
-    const float diff = std::fabs(actual[i] - expected[i]);
-    if (diff > maxAbsDiff) {
-      maxAbsDiff = diff;
-      maxIndex = i;
+  float maximumError = 0.0f;
+  for (size_t i = 0; i < yCount; ++i) {
+    const float error = std::fabs(actual[i] - expected[i]);
+    maximumError = std::max(maximumError, error);
+    const float tolerance = 2.0e-4f * std::max(1.0f, std::fabs(expected[i]));
+    if (!std::isfinite(actual[i]) || error > tolerance) {
+      std::fprintf(stderr,
+          "FAIL %s at %zu: expected %.9g, got %.9g, error %.9g\n",
+          test.name, i, expected[i], actual[i], error);
+      return false;
     }
   }
 
-  const float tolerance = 1e-4f;
-  if (maxAbsDiff > tolerance) {
-    std::printf("FAIL case=%s max_abs_diff=%g index=%zu actual=%g expected=%g\n",
-        tc.name, maxAbsDiff, maxIndex, actual[maxIndex], expected[maxIndex]);
-    return false;
-  }
-
-  std::printf("PASS case=%s max_abs_diff=%g\n", tc.name, maxAbsDiff);
+  std::printf(
+      "PASS %s max_abs_error=%.9g\n"
+      "  bo_alloc=%8.3f ms  host_write=%8.3f ms  h2d_sync=%8.3f ms\n"
+      "  run_wait=%8.3f ms  d2h_sync=%8.3f ms  host_read=%8.3f ms\n",
+      test.name, maximumError, milliseconds(allocationStart, allocationEnd),
+      milliseconds(writeStart, writeEnd), milliseconds(h2dStart, h2dEnd),
+      milliseconds(waitStart, waitEnd), milliseconds(d2hStart, d2hEnd),
+      milliseconds(readStart, readEnd));
   return true;
-}
-
-void usage(const char *argv0) {
-  std::fprintf(stderr,
-      "usage: %s <conv2d_kernel.xclbin> [--medium|--all|--probe-only]\n"
-      "env: HOST_XRT_TIMEOUT_SEC=30 HOST_XRT_RUN_TIMEOUT_MS=5000\n",
-      argv0);
 }
 
 } // namespace
@@ -259,14 +244,19 @@ int main(int argc, char **argv) {
   std::setvbuf(stderr, nullptr, _IONBF, 0);
 
   if (argc < 2 || argc > 3) {
-    usage(argv[0]);
+    std::fprintf(stderr,
+        "usage: %s <two-kernel.xclbin> "
+        "[--probe-only|--1x1-only|--3x3-only]\n",
+        argv[0]);
     return 2;
   }
 
-  const std::string mode = argc == 3 ? argv[2] : "";
-  if (!mode.empty() && mode != "--medium" && mode != "--all" &&
-      mode != "--probe-only") {
-    usage(argv[0]);
+  const bool probeOnly =
+      argc == 3 && std::strcmp(argv[2], "--probe-only") == 0;
+  const bool run1x1 = argc == 2 || std::strcmp(argv[2], "--1x1-only") == 0;
+  const bool run3x3 = argc == 2 || std::strcmp(argv[2], "--3x3-only") == 0;
+  if (!probeOnly && !run1x1 && !run3x3) {
+    std::fprintf(stderr, "error: unknown option: %s\n", argv[2]);
     return 2;
   }
 
@@ -277,8 +267,8 @@ int main(int argc, char **argv) {
     alarm(timeoutSec);
 
   if (!fileExists(argv[1])) {
-    std::fprintf(stderr, "FAIL preflight: xclbin does not exist: %s\n",
-        argv[1]);
+    std::fprintf(
+        stderr, "FAIL preflight: xclbin does not exist: %s\n", argv[1]);
     return 2;
   }
   if (!deviceNodeExists()) {
@@ -289,35 +279,35 @@ int main(int argc, char **argv) {
   }
 
   try {
-    step("opening XRT device 0");
     xrt::device device(0);
-    step("loading xclbin");
-    xrt::uuid uuid = device.load_xclbin(argv[1]);
-    step("opening kernel conv2d_kernel");
-    xrt::kernel kernel(device, uuid, "conv2d_kernel");
-    step("XRT setup completed");
-    if (mode == "--probe-only") {
-      step("probe-only requested; exiting before kernel launch");
+    const xrt::uuid uuid = device.load_xclbin(argv[1]);
+    if (probeOnly) {
+      xrt::kernel conv1x1(device, uuid, "conv1x1_kernel");
+      xrt::kernel conv3x3(device, uuid, "conv3x3_kernel");
+      std::printf("PASS loaded xclbin and opened both kernel handles\n");
       alarm(0);
       return 0;
     }
-
-    const ConvCase tiny = {"tiny", 1, 1, 4, 4, 1, 3, 3, 0, 0, 1, 1};
-    const ConvCase medium = {"medium", 1, 4, 16, 16, 4, 3, 3, 0, 0, 1, 1};
-
-    bool ok = true;
-    if (mode == "--medium") {
-      ok = runCase(device, kernel, medium, runTimeoutMs);
-    } else {
-      ok = runCase(device, kernel, tiny, runTimeoutMs);
-      if (ok && mode == "--all")
-        ok = runCase(device, kernel, medium, runTimeoutMs);
+    std::mt19937 generator(0x498);
+    bool passed = true;
+    if (run1x1) {
+      xrt::kernel kernel(device, uuid, "conv1x1_kernel");
+      const ConvCase test = {
+          "conv1x1_kernel", 1, 5, 4, 7, 17, 1, 0, 1, true};
+      passed =
+          runCase(device, kernel, test, generator, runTimeoutMs) && passed;
     }
-
+    if (run3x3) {
+      xrt::kernel kernel(device, uuid, "conv3x3_kernel");
+      const ConvCase test = {
+          "conv3x3_kernel", 1, 5, 7, 6, 17, 3, 1, 2, true};
+      passed =
+          runCase(device, kernel, test, generator, runTimeoutMs) && passed;
+    }
     alarm(0);
-    return ok ? 0 : 1;
-  } catch (const std::exception &e) {
-    std::fprintf(stderr, "error: %s\n", e.what());
+    return passed ? 0 : 1;
+  } catch (const std::exception &error) {
+    std::fprintf(stderr, "XRT test failed: %s\n", error.what());
     return 1;
   }
 }
