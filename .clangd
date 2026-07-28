@@ -1,0 +1,4 @@
+CompileFlags:
+  # Use the host-native CMake compilation database. This contains the generated
+  # include paths and compile definitions needed by ONNX-MLIR and MyAccel.
+  CompilationDatabase: build-host-exact
