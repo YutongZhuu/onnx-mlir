@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -192,15 +193,46 @@ static void my_conv_f32_cpu_fallback(float *y, const float *x, const float *w,
     }
 }
 
-// Compute the FP32 value represented by a QDQ-wrapped INT8 convolution. The
-// convolution products accumulate exactly in int32, then use the QDQ scales to
-// recreate the floating-point Conv result expected by the existing graph.
+static int8_t requantize_i8(int32_t sum, int32_t bias, int32_t biasZeroPoint,
+    float productScale, float biasScale, float outputScale,
+    int32_t outputZeroPoint) {
+  double quantized;
+  const float scaleTolerance =
+      1.0e-6f * fmaxf(fabsf(productScale), fabsf(biasScale));
+  if (biasZeroPoint == 0 &&
+      fabsf(productScale - biasScale) <= scaleTolerance) {
+    // QLinearConv defines the int32 bias at x_scale * w_scale. Match MLAS's
+    // ordering: add it to the integer accumulator, then apply one float32
+    // output multiplier. Keeping these as float operations is significant for
+    // exact ties-to-even behavior at quantization boundaries.
+    const int64_t accumulator = (int64_t)sum + (int64_t)bias;
+    const float multiplier = productScale / outputScale;
+    quantized = (double)nearbyintf((float)accumulator * multiplier) +
+                outputZeroPoint;
+  } else {
+    // Preserve the general QDQ semantics if a model supplies an independently
+    // scaled or nonzero-point bias that cannot be represented by QLinearConv.
+    const double realValue =
+        (double)sum * productScale +
+        (double)(bias - biasZeroPoint) * biasScale;
+    quantized = nearbyint(realValue / outputScale) + outputZeroPoint;
+  }
+  if (quantized < -128.0)
+    quantized = -128.0;
+  else if (quantized > 127.0)
+    quantized = 127.0;
+  return (int8_t)quantized;
+}
+
+// Compute a QDQ-wrapped INT8 convolution and directly requantize its int32
+// accumulator to the output QuantizeLinear's signed-int8 representation.
 // NCHW input and OIHW weights are assumed.
-void my_conv_qdq_i8_f32(OMTensor *yTensor, const OMTensor *xTensor,
+void my_conv_qdq_i8(OMTensor *yTensor, const OMTensor *xTensor,
     const OMTensor *xScaleTensor, const OMTensor *xZeroPointTensor,
     const OMTensor *wTensor, const OMTensor *wScaleTensor,
     const OMTensor *wZeroPointTensor, const OMTensor *bTensor,
     const OMTensor *bScaleTensor, const OMTensor *bZeroPointTensor,
+    const OMTensor *yScaleTensor, const OMTensor *yZeroPointTensor,
     int64_t dh, int64_t dw, int64_t group, int64_t padLeft, int64_t padTop,
     int64_t sh, int64_t sw) {
   const int64_t *xs = omTensorGetShape(xTensor);
@@ -209,7 +241,7 @@ void my_conv_qdq_i8_f32(OMTensor *yTensor, const OMTensor *xTensor,
   const int8_t *x = (const int8_t *)omTensorGetDataPtr(xTensor);
   const int8_t *w = (const int8_t *)omTensorGetDataPtr(wTensor);
   const int32_t *b = (const int32_t *)omTensorGetDataPtr(bTensor);
-  float *y = (float *)omTensorGetDataPtr(yTensor);
+  int8_t *y = (int8_t *)omTensorGetDataPtr(yTensor);
   const float xScale = *(const float *)omTensorGetDataPtr(xScaleTensor);
   const int16_t xZeroPoint =
       *(const int8_t *)omTensorGetDataPtr(xZeroPointTensor);
@@ -219,6 +251,9 @@ void my_conv_qdq_i8_f32(OMTensor *yTensor, const OMTensor *xTensor,
   const float bScale = *(const float *)omTensorGetDataPtr(bScaleTensor);
   const int32_t bZeroPoint =
       *(const int32_t *)omTensorGetDataPtr(bZeroPointTensor);
+  const float yScale = *(const float *)omTensorGetDataPtr(yScaleTensor);
+  const int16_t yZeroPoint =
+      *(const int8_t *)omTensorGetDataPtr(yZeroPointTensor);
 
   const int64_t nSize = xs[0], cSize = xs[1], hSize = xs[2], wSize = xs[3];
   const int64_t mSize = ws[0], cPerGroup = ws[1];
@@ -287,33 +322,35 @@ void my_conv_qdq_i8_f32(OMTensor *yTensor, const OMTensor *xTensor,
       for (int64_t mg = 0; mg < mPerGroup; ++mg) {
         const int64_t m = g * mPerGroup + mg;
         const int8_t *weight = w + m * reductionSize;
-        float *output = y + (n * mSize + m) * spatialSize;
-        const float bias = ((float)(b[m] - bZeroPoint)) * bScale;
+        int8_t *output = y + (n * mSize + m) * spatialSize;
         int64_t position = 0;
 
 #if defined(__aarch64__)
-        const int16x8_t xZeroPointVector = vdupq_n_s16(xZeroPoint);
-        for (; position + 8 <= spatialSize; position += 8) {
-          int32x4_t sumLow = vdupq_n_s32(0);
-          int32x4_t sumHigh = vdupq_n_s32(0);
-          for (int64_t reduction = 0; reduction < reductionSize; ++reduction) {
-            const int8x8_t input8 =
-                vld1_s8(matrixB + reduction * spatialSize + position);
-            const int16x8_t centeredInput =
-                vsubq_s16(vmovl_s8(input8), xZeroPointVector);
-            const int16_t centeredWeight =
-                (int16_t)weight[reduction] - wZeroPoint;
-            sumLow = vmlal_n_s16(
-                sumLow, vget_low_s16(centeredInput), centeredWeight);
-            sumHigh = vmlal_n_s16(
-                sumHigh, vget_high_s16(centeredInput), centeredWeight);
+        if (!getenv("MYACCEL_DISABLE_SIMD")) {
+          const int16x8_t xZeroPointVector = vdupq_n_s16(xZeroPoint);
+          for (; position + 8 <= spatialSize; position += 8) {
+            int32x4_t sumLow = vdupq_n_s32(0);
+            int32x4_t sumHigh = vdupq_n_s32(0);
+            for (int64_t reduction = 0; reduction < reductionSize;
+                 ++reduction) {
+              const int8x8_t input8 =
+                  vld1_s8(matrixB + reduction * spatialSize + position);
+              const int16x8_t centeredInput =
+                  vsubq_s16(vmovl_s8(input8), xZeroPointVector);
+              const int16_t centeredWeight =
+                  (int16_t)weight[reduction] - wZeroPoint;
+              sumLow = vmlal_n_s16(
+                  sumLow, vget_low_s16(centeredInput), centeredWeight);
+              sumHigh = vmlal_n_s16(
+                  sumHigh, vget_high_s16(centeredInput), centeredWeight);
+            }
+            int32_t sums[8];
+            vst1q_s32(sums, sumLow);
+            vst1q_s32(sums + 4, sumHigh);
+            for (int lane = 0; lane < 8; ++lane)
+              output[position + lane] = requantize_i8(sums[lane], b[m],
+                  bZeroPoint, productScale, bScale, yScale, yZeroPoint);
           }
-          const float32x4_t resultLow = vmlaq_n_f32(vdupq_n_f32(bias),
-              vcvtq_f32_s32(sumLow), productScale);
-          const float32x4_t resultHigh = vmlaq_n_f32(vdupq_n_f32(bias),
-              vcvtq_f32_s32(sumHigh), productScale);
-          vst1q_f32(output + position, resultLow);
-          vst1q_f32(output + position + 4, resultHigh);
         }
 #endif
 
@@ -323,7 +360,8 @@ void my_conv_qdq_i8_f32(OMTensor *yTensor, const OMTensor *xTensor,
             sum += ((int32_t)matrixB[reduction * spatialSize + position] -
                        xZeroPoint) *
                    ((int32_t)weight[reduction] - wZeroPoint);
-          output[position] = (float)sum * productScale + bias;
+          output[position] = requantize_i8(sum, b[m], bZeroPoint,
+              productScale, bScale, yScale, yZeroPoint);
         }
       }
     }

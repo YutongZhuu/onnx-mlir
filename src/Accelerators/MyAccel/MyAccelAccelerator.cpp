@@ -18,39 +18,50 @@ static bool isStaticScalarLike(Value value, Type elementType) {
   return type.getNumElements() == 1;
 }
 
-// If all Conv operands are produced by per-tensor QDQ nodes, call the INT8
-// runtime directly with the quantized tensors and their quantization metadata.
-// The runtime returns the exact FP32 value represented by the three input
-// DequantizeLinear operations; the existing output QuantizeLinear is left in
-// the graph so this rewrite does not change the public model interface.
+// Fuse a per-tensor QDQ Conv and its sole output QuantizeLinear. The runtime
+// consumes the original quantized tensors, accumulates in int32, and directly
+// requantizes to the output's int8 scale. The following DequantizeLinear (if
+// any) remains in the graph and consumes this fused int8 result.
 static LogicalResult rewriteQDQConv(ONNXConvOp conv,
     ONNXConvOpAdaptor adaptor, ConversionPatternRewriter &rewriter,
     const TypeConverter *typeConverter) {
   auto xDQ = conv.getX().getDefiningOp<ONNXDequantizeLinearOp>();
   auto wDQ = conv.getW().getDefiningOp<ONNXDequantizeLinearOp>();
   auto bDQ = conv.getB().getDefiningOp<ONNXDequantizeLinearOp>();
-  if (!xDQ || !wDQ || !bDQ)
+  if (!xDQ || !wDQ || !bDQ || !conv.getY().hasOneUse())
+    return failure();
+  auto outputQ =
+      dyn_cast<ONNXQuantizeLinearOp>(*conv.getY().getUsers().begin());
+  if (!outputQ)
     return failure();
 
   auto xType = dyn_cast<RankedTensorType>(xDQ.getX().getType());
   auto wType = dyn_cast<RankedTensorType>(wDQ.getX().getType());
   auto bType = dyn_cast<RankedTensorType>(bDQ.getX().getType());
   auto yType = dyn_cast<RankedTensorType>(conv.getY().getType());
+  auto quantizedYType =
+      dyn_cast<RankedTensorType>(outputQ.getY().getType());
   auto i8Type = rewriter.getI8Type();
   auto i32Type = rewriter.getI32Type();
   auto f32Type = rewriter.getF32Type();
-  if (!xType || !wType || !bType || !yType || xType.getRank() != 4 ||
+  if (!xType || !wType || !bType || !yType || !quantizedYType ||
+      xType.getRank() != 4 ||
       wType.getRank() != 4 || bType.getRank() != 1 || yType.getRank() != 4 ||
+      quantizedYType.getRank() != 4 ||
       !xType.hasStaticShape() || !wType.hasStaticShape() ||
       !bType.hasStaticShape() || !yType.hasStaticShape() ||
+      !quantizedYType.hasStaticShape() ||
       xType.getElementType() != i8Type || wType.getElementType() != i8Type ||
       bType.getElementType() != i32Type || !yType.getElementType().isF32() ||
+      quantizedYType.getElementType() != i8Type ||
       !isStaticScalarLike(xDQ.getXScale(), f32Type) ||
       !isStaticScalarLike(xDQ.getXZeroPoint(), i8Type) ||
       !isStaticScalarLike(wDQ.getXScale(), f32Type) ||
       !isStaticScalarLike(wDQ.getXZeroPoint(), i8Type) ||
       !isStaticScalarLike(bDQ.getXScale(), f32Type) ||
-      !isStaticScalarLike(bDQ.getXZeroPoint(), i32Type))
+      !isStaticScalarLike(bDQ.getXZeroPoint(), i32Type) ||
+      !isStaticScalarLike(outputQ.getYScale(), f32Type) ||
+      !isStaticScalarLike(outputQ.getYZeroPoint(), i8Type))
     return failure();
 
   Operation *op = conv.getOperation();
@@ -60,14 +71,19 @@ static LogicalResult rewriteQDQConv(ONNXConvOp conv,
   ONNXConvOpShapeHelper shapeHelper(op, adaptor.getOperands(), &create.krnlIE);
   if (failed(shapeHelper.computeShape()))
     return failure();
-  std::vector<Value> outputs = allocForONNXOp<ONNXConvOp>(
-      conv, rewriter, typeConverter, shapeHelper);
+  auto quantizedYMemRefType = dyn_cast<MemRefType>(
+      typeConverter->convertType(outputQ.getY().getType()));
+  if (!quantizedYMemRefType)
+    return failure();
+  std::vector<Value> outputs = {
+      create.mem.alignedAlloc(quantizedYMemRefType)};
 
-  SmallVector<Value, 9> originalQuantizedOperands = {
+  SmallVector<Value, 11> originalQuantizedOperands = {
       xDQ.getX(), xDQ.getXScale(), xDQ.getXZeroPoint(),
       wDQ.getX(), wDQ.getXScale(), wDQ.getXZeroPoint(),
-      bDQ.getX(), bDQ.getXScale(), bDQ.getXZeroPoint()};
-  SmallVector<Value, 9> convertedQuantizedOperands;
+      bDQ.getX(), bDQ.getXScale(), bDQ.getXZeroPoint(),
+      outputQ.getYScale(), outputQ.getYZeroPoint()};
+  SmallVector<Value, 11> convertedQuantizedOperands;
   for (Value operand : originalQuantizedOperands) {
     Value converted = rewriter.getRemappedValue(operand);
     if (!converted)
@@ -81,7 +97,7 @@ static LogicalResult rewriteQDQConv(ONNXConvOp conv,
       return defaultValue;
     return cast<IntegerAttr>((*attr)[index]).getInt();
   };
-  auto call = KrnlCallOp::create(rewriter, loc, "my_conv_qdq_i8_f32",
+  auto call = KrnlCallOp::create(rewriter, loc, "my_conv_qdq_i8",
       outputs, op, convertedQuantizedOperands, false);
   call->setAttr("dilation_h", rewriter.getI64IntegerAttr(
       getArrayValue(conv.getDilations(), 0, 1)));
@@ -96,7 +112,8 @@ static LogicalResult rewriteQDQConv(ONNXConvOp conv,
       getArrayValue(conv.getStrides(), 0, 1)));
   call->setAttr("stride_w", rewriter.getI64IntegerAttr(
       getArrayValue(conv.getStrides(), 1, 1)));
-  rewriter.replaceOp(op, outputs);
+  rewriter.replaceOp(outputQ, outputs);
+  rewriter.eraseOp(op);
   return success();
 }
 
