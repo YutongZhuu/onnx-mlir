@@ -24,6 +24,7 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *, const int8_t *,
 #else
 
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -44,6 +45,70 @@ double milliseconds(Clock::time_point start, Clock::time_point end) {
 bool envFlagEnabled(const char *name) {
   const char *value = getenv(name);
   return value && value[0] && strcmp(value, "0") != 0;
+}
+
+unsigned int envPositiveUInt(
+    const char *name, unsigned int fallback) {
+  const char *value = getenv(name);
+  if (!value || !value[0])
+    return fallback;
+
+  char *end = nullptr;
+  const unsigned long parsed = strtoul(value, &end, 10);
+  if (!end || *end != '\0' || parsed == 0 || parsed > UINT_MAX) {
+    fprintf(stderr, "MYACCEL: ignoring invalid %s=%s\n", name, value);
+    return fallback;
+  }
+  return (unsigned int)parsed;
+}
+
+const char *commandStateName(ert_cmd_state state) {
+  switch (state) {
+  case ERT_CMD_STATE_NEW:
+    return "NEW";
+  case ERT_CMD_STATE_QUEUED:
+    return "QUEUED";
+  case ERT_CMD_STATE_RUNNING:
+    return "RUNNING";
+  case ERT_CMD_STATE_COMPLETED:
+    return "COMPLETED";
+  case ERT_CMD_STATE_ERROR:
+    return "ERROR";
+  case ERT_CMD_STATE_ABORT:
+    return "ABORT";
+  case ERT_CMD_STATE_SUBMITTED:
+    return "SUBMITTED";
+  case ERT_CMD_STATE_TIMEOUT:
+    return "TIMEOUT";
+  case ERT_CMD_STATE_NORESPONSE:
+    return "NORESPONSE";
+  case ERT_CMD_STATE_SKERROR:
+    return "SKERROR";
+  case ERT_CMD_STATE_SKCRASHED:
+    return "SKCRASHED";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+ert_cmd_state waitForRun(xrt::run &run, unsigned int timeoutMs,
+    const char *kernelName) {
+  const ert_cmd_state state = run.wait(timeoutMs);
+  if (state != ERT_CMD_STATE_TIMEOUT)
+    return state;
+
+  try {
+    const ert_cmd_state abortState = run.abort();
+    fprintf(stderr,
+        "MYACCEL: %s timed out after %u ms; abort returned %s(%d)\n",
+        kernelName, timeoutMs, commandStateName(abortState),
+        (int)abortState);
+  } catch (const std::exception &error) {
+    fprintf(stderr,
+        "MYACCEL: %s timed out after %u ms; abort failed: %s\n",
+        kernelName, timeoutMs, error.what());
+  }
+  return state;
 }
 
 struct ReusableBo {
@@ -316,6 +381,8 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
     const bool profile = envFlagEnabled("MYACCEL_PROFILE");
     const bool useBufferPool =
         !envFlagEnabled("MYACCEL_DISABLE_BO_POOL");
+    const unsigned int runTimeoutMs =
+        envPositiveUInt("MYACCEL_XRT_RUN_TIMEOUT_MS", 30000);
     const auto totalStart = Clock::now();
     if (!x || !weight || !bias || !y || n_size <= 0 || c_size <= 0 ||
         h_size <= 0 || input_w_size <= 0 || m_size <= 0 || oh_size <= 0 ||
@@ -431,13 +498,14 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
     Clock::time_point submitEnd;
     Clock::time_point waitStart;
     Clock::time_point waitEnd;
+    ert_cmd_state runState = ERT_CMD_STATE_NEW;
     if (is1x1) {
       auto run = (*kernel)(xBo, wBo, bBo, yBo, n_size, c_size, h_size,
           input_w_size, m_size, x_zero_point, w_zero_point,
           requant_multiplier_bits, output_zero_point);
       submitEnd = Clock::now();
       waitStart = Clock::now();
-      run.wait();
+      runState = waitForRun(run, runTimeoutMs, kernelName);
       waitEnd = Clock::now();
     } else {
       auto run = (*kernel)(xBo, wBo, bBo, yBo, n_size, c_size, h_size,
@@ -446,8 +514,15 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
           output_zero_point);
       submitEnd = Clock::now();
       waitStart = Clock::now();
-      run.wait();
+      runState = waitForRun(run, runTimeoutMs, kernelName);
       waitEnd = Clock::now();
+    }
+
+    if (runState != ERT_CMD_STATE_COMPLETED) {
+      fprintf(stderr, "MYACCEL: %s returned state=%s(%d); using host "
+                      "fallback\n",
+          kernelName, commandStateName(runState), (int)runState);
+      return 0;
     }
 
     const auto ySyncStart = Clock::now();
