@@ -29,6 +29,8 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *, const int8_t *,
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <vector>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -91,23 +93,32 @@ const char *commandStateName(ert_cmd_state state) {
   }
 }
 
+bool isQuiescentCommandState(ert_cmd_state state) {
+  switch (state) {
+  case ERT_CMD_STATE_COMPLETED:
+  case ERT_CMD_STATE_ERROR:
+  case ERT_CMD_STATE_ABORT:
+  case ERT_CMD_STATE_SKERROR:
+  case ERT_CMD_STATE_SKCRASHED:
+    return true;
+  default:
+    return false;
+  }
+}
+
 ert_cmd_state waitForRun(xrt::run &run, unsigned int timeoutMs,
     const char *kernelName) {
   const ert_cmd_state state = run.wait(timeoutMs);
   if (state != ERT_CMD_STATE_TIMEOUT)
     return state;
 
-  try {
-    const ert_cmd_state abortState = run.abort();
-    fprintf(stderr,
-        "MYACCEL: %s timed out after %u ms; abort returned %s(%d)\n",
-        kernelName, timeoutMs, commandStateName(abortState),
-        (int)abortState);
-  } catch (const std::exception &error) {
-    fprintf(stderr,
-        "MYACCEL: %s timed out after %u ms; abort failed: %s\n",
-        kernelName, timeoutMs, error.what());
-  }
+  const ert_cmd_state abortState = run.abort();
+  fprintf(stderr,
+      "MYACCEL: %s timed out after %u ms; abort returned %s(%d)\n",
+      kernelName, timeoutMs, commandStateName(abortState), (int)abortState);
+  if (!isQuiescentCommandState(abortState))
+    throw std::runtime_error(
+        "XRT abort did not confirm that the compute unit is quiescent");
   return state;
 }
 
@@ -150,6 +161,8 @@ struct XrtContext {
   KernelBufferPool conv1x1I8Buffers;
   KernelBufferPool conv3x3I8Buffers;
   KernelBufferPool conv6x6StemI8Buffers;
+  std::vector<KernelBufferPool> quarantinedInt8Buffers;
+  bool int8ExecutionPoisoned = false;
   std::mutex executionMutex;
 
   explicit XrtContext(const char *xclbin)
@@ -161,6 +174,15 @@ std::mutex g_contextMutex;
 
 void releaseContextAtExit() {
   std::lock_guard<std::mutex> lock(g_contextMutex);
+  if (g_ctx) {
+    std::lock_guard<std::mutex> executionLock(g_ctx->executionMutex);
+    if (g_ctx->int8ExecutionPoisoned) {
+      fprintf(stderr, "MYACCEL: retaining quarantined XRT buffers until "
+                      "process teardown\n");
+      (void)g_ctx.release();
+      return;
+    }
+  }
   g_ctx.reset();
 }
 
@@ -243,6 +265,11 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
     const auto queueStart = Clock::now();
     std::lock_guard<std::mutex> executionLock(ctx->executionMutex);
     const auto queueEnd = Clock::now();
+    if (ctx->int8ExecutionPoisoned) {
+      fprintf(stderr, "MYACCEL: INT8 XRT context is quarantined after an "
+                      "unconfirmed command termination; using host fallback\n");
+      return 0;
+    }
     const auto kernelOpenStart = Clock::now();
     if (!*kernelSlot)
       *kernelSlot =
@@ -499,26 +526,39 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
     Clock::time_point waitStart;
     Clock::time_point waitEnd;
     ert_cmd_state runState = ERT_CMD_STATE_NEW;
-    if (is1x1) {
-      auto run = (*kernel)(xBo, wBo, bBo, yBo, n_size, c_size, h_size,
-          input_w_size, m_size, x_zero_point, w_zero_point,
-          requant_multiplier_bits, output_zero_point);
-      submitEnd = Clock::now();
-      waitStart = Clock::now();
-      runState = waitForRun(run, runTimeoutMs, kernelName);
-      waitEnd = Clock::now();
-    } else {
-      auto run = (*kernel)(xBo, wBo, bBo, yBo, n_size, c_size, h_size,
-          input_w_size, m_size, oh_size, ow_size, pad_left, pad_top, stride_h,
-          stride_w, x_zero_point, w_zero_point, requant_multiplier_bits,
-          output_zero_point);
-      submitEnd = Clock::now();
-      waitStart = Clock::now();
-      runState = waitForRun(run, runTimeoutMs, kernelName);
-      waitEnd = Clock::now();
+    auto quarantineExecution = [&]() {
+      ctx->int8ExecutionPoisoned = true;
+      if (!useBufferPool)
+        ctx->quarantinedInt8Buffers.emplace_back(std::move(transientPool));
+    };
+    try {
+      if (is1x1) {
+        auto run = (*kernel)(xBo, wBo, bBo, yBo, n_size, c_size, h_size,
+            input_w_size, m_size, x_zero_point, w_zero_point,
+            requant_multiplier_bits, output_zero_point);
+        submitEnd = Clock::now();
+        waitStart = Clock::now();
+        runState = waitForRun(run, runTimeoutMs, kernelName);
+        waitEnd = Clock::now();
+      } else {
+        auto run = (*kernel)(xBo, wBo, bBo, yBo, n_size, c_size, h_size,
+            input_w_size, m_size, oh_size, ow_size, pad_left, pad_top,
+            stride_h, stride_w, x_zero_point, w_zero_point,
+            requant_multiplier_bits, output_zero_point);
+        submitEnd = Clock::now();
+        waitStart = Clock::now();
+        runState = waitForRun(run, runTimeoutMs, kernelName);
+        waitEnd = Clock::now();
+      }
+    } catch (...) {
+      quarantineExecution();
+      throw;
     }
 
     if (runState != ERT_CMD_STATE_COMPLETED) {
+      if (runState != ERT_CMD_STATE_TIMEOUT &&
+          !isQuiescentCommandState(runState))
+        quarantineExecution();
       fprintf(stderr, "MYACCEL: %s returned state=%s(%d); using host "
                       "fallback\n",
           kernelName, commandStateName(runState), (int)runState);
