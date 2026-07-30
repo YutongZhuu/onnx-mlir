@@ -473,6 +473,11 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
     const auto queueStart = Clock::now();
     std::lock_guard<std::mutex> executionLock(ctx->executionMutex);
     const auto queueEnd = Clock::now();
+    if (ctx->int8ExecutionPoisoned) {
+      fprintf(stderr, "MYACCEL: INT8 XRT context is quarantined after an "
+                      "unconfirmed command termination; using host fallback\n");
+      return 0;
+    }
     const auto kernelOpenStart = Clock::now();
     if (!*kernelSlot)
       *kernelSlot =
