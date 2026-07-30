@@ -384,8 +384,9 @@ static int8_t requantize_i8(int32_t sum, int32_t bias, int32_t biasZeroPoint,
 
 // Compute a QDQ-wrapped INT8 convolution. Supported 1x1 and 3x3 QLinearConv
 // layers send the dot product, bias, and bit-exact INT8 requantization to XRT.
-// Other kernel sizes, general bias quantization, and CPU=1 use the host path.
-// NCHW input and OIHW weights are assumed.
+// A matching three-CU xclbin can also enable the specialized 6x6 stem with
+// MYACCEL_ENABLE_6X6_STEM=1. Other kernel sizes, general bias quantization,
+// and CPU=1 use the host path. NCHW input and OIHW weights are assumed.
 void my_conv_qdq_i8(OMTensor *yTensor, const OMTensor *xTensor,
     const OMTensor *xScaleTensor, const OMTensor *xZeroPointTensor,
     const OMTensor *wTensor, const OMTensor *wScaleTensor,
