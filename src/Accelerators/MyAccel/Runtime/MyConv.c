@@ -15,6 +15,7 @@
 #include "Conv1x1Int8Kernel.h"
 #include "Conv3x3Kernel.h"
 #include "Conv3x3Int8Kernel.h"
+#include "Conv6x6StemInt8Kernel.h"
 #include "MyAccelXrt.h"
 #include "onnx-mlir/Runtime/OMTensor.h"
 
@@ -73,6 +74,11 @@ static void set_reason(char *reason, size_t reasonSize, const char *text) {
 static int force_cpu_requested(void) {
   const char *cpu = getenv("CPU");
   return (cpu && strcmp(cpu, "1") == 0) || getenv("MYACCEL_FORCE_CPU");
+}
+
+static int env_flag_enabled(const char *name) {
+  const char *value = getenv(name);
+  return value && value[0] && strcmp(value, "0") != 0;
 }
 
 static int check_support(const int64_t *xs, const int64_t *ws,
@@ -213,31 +219,45 @@ static int check_i8_support(const int64_t *xs, const int64_t *ws,
 
   const int is1x1 = ws[2] == 1 && ws[3] == 1;
   const int is3x3 = ws[2] == 3 && ws[3] == 3;
-  if (!is1x1 && !is3x3) {
+  const int is6x6 = ws[2] == 6 && ws[3] == 6;
+  if (!is1x1 && !is3x3 && !is6x6) {
     set_reason(reason, reasonSize,
-        "only 1x1 and 3x3 INT8 kernels are supported");
+        "only 1x1, 3x3, and the 6x6 INT8 stem are supported");
     return 0;
   }
   if (is1x1 &&
       (xs[1] > MYACCEL_CONV1X1_INT8_MAX_INPUT_CHANNELS || sh != 1 ||
           sw != 1 || padLeft != 0 || padTop != 0 || ys[2] != xs[2] ||
-          ys[3] != xs[3])) {
+          ys[3] != xs[3] || xs[1] % 4 != 0 ||
+          (xs[2] * xs[3]) % 4 != 0)) {
     set_reason(reason, reasonSize,
         "INT8 1x1 convolution exceeds channel limit or requires "
-        "padding/stride");
+        "padding/stride/non-word-aligned data");
     return 0;
   }
   if (is3x3 &&
       (xs[1] > MYACCEL_CONV3X3_INT8_MAX_INPUT_CHANNELS ||
           sh > MYACCEL_CONV3X3_INT8_MAX_STRIDE ||
-          sw > MYACCEL_CONV3X3_INT8_MAX_STRIDE)) {
+          sw > MYACCEL_CONV3X3_INT8_MAX_STRIDE || xs[1] % 4 != 0 ||
+          xs[3] % 4 != 0 || ys[3] % 4 != 0)) {
     set_reason(reason, reasonSize,
-        "INT8 3x3 convolution exceeds channel or stride limit");
+        "INT8 3x3 convolution exceeds channel/stride/alignment limits");
+    return 0;
+  }
+  if (is6x6 &&
+      (!env_flag_enabled("MYACCEL_ENABLE_6X6_STEM") ||
+          xs[1] > MYACCEL_CONV6X6_STEM_INT8_MAX_INPUT_CHANNELS ||
+          sh > MYACCEL_CONV6X6_STEM_INT8_MAX_STRIDE ||
+          sw > MYACCEL_CONV6X6_STEM_INT8_MAX_STRIDE || xs[3] % 4 != 0 ||
+          ys[3] % 4 != 0)) {
+    set_reason(reason, reasonSize,
+        "INT8 6x6 stem is disabled or exceeds channel/stride/alignment "
+        "limits (set MYACCEL_ENABLE_6X6_STEM=1 for a matching xclbin)");
     return 0;
   }
 
   const int64_t maxOutputPixels =
-      read_nonnegative_env_i64("MYACCEL_MAX_OUTPUT_PIXELS", 80 * 80);
+      read_nonnegative_env_i64("MYACCEL_MAX_OUTPUT_PIXELS", 320 * 320);
   if (maxOutputPixels > 0 && ys[2] * ys[3] > maxOutputPixels) {
     snprintf(reason, reasonSize,
         "output spatial size %lld exceeds MYACCEL_MAX_OUTPUT_PIXELS=%lld",

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -218,6 +219,29 @@ void referenceConv(const ConvCase &test, const std::vector<int8_t> &x,
         }
 }
 
+std::vector<uint32_t> packInt8Words(const std::vector<int8_t> &bytes) {
+  if (bytes.size() % 4 != 0) {
+    std::fprintf(stderr, "packed INT8 test input is not word aligned\n");
+    std::abort();
+  }
+  std::vector<uint32_t> words(bytes.size() / 4, 0);
+  for (size_t i = 0; i < bytes.size(); ++i)
+    words[i / 4] |= (uint32_t)(uint8_t)bytes[i] << ((i % 4) * 8);
+  return words;
+}
+
+std::vector<int8_t> unpackInt8Words(
+    const std::vector<uint32_t> &words, size_t byteCount) {
+  if (byteCount % 4 != 0 || words.size() != byteCount / 4) {
+    std::fprintf(stderr, "packed INT8 test output has an invalid size\n");
+    std::abort();
+  }
+  std::vector<int8_t> bytes(byteCount);
+  for (size_t i = 0; i < byteCount; ++i)
+    bytes[i] = (int8_t)((words[i / 4] >> ((i % 4) * 8)) & 0xffU);
+  return bytes;
+}
+
 bool runCase(const ConvCase &test, std::mt19937 &generator) {
   const int ohSize =
       (test.h + 2 * test.pad - test.kernel) / test.stride + 1;
@@ -241,19 +265,31 @@ bool runCase(const ConvCase &test, std::mt19937 &generator) {
   for (int32_t &value : bias)
     value = biasDistribution(generator);
 
-  std::vector<int8_t> expected(outputCount);
-  std::vector<int8_t> actual(outputCount, 0);
-  referenceConv(test, x, weight, bias, expected, ohSize, owSize);
-  if (test.kernel == 1) {
-    conv1x1_i8_kernel(x.data(), weight.data(), bias.data(), actual.data(),
-        test.n, test.c, test.h, test.w, test.m, test.xZeroPoint,
-        test.wZeroPoint, test.multiplierBits, test.outputZeroPoint);
-  } else {
-    conv3x3_i8_kernel(x.data(), weight.data(), bias.data(), actual.data(),
-        test.n, test.c, test.h, test.w, test.m, ohSize, owSize, test.pad,
-        test.pad, test.stride, test.stride, test.xZeroPoint, test.wZeroPoint,
-        test.multiplierBits, test.outputZeroPoint);
+  if (xCount % 4 != 0 || weightCount % 4 != 0 || outputCount % 4 != 0) {
+    std::fprintf(stderr, "FAIL %-30s packed count is not word aligned\n",
+        test.name);
+    return false;
   }
+
+  std::vector<int8_t> expected(outputCount);
+  referenceConv(test, x, weight, bias, expected, ohSize, owSize);
+  const std::vector<uint32_t> packedX = packInt8Words(x);
+  const std::vector<uint32_t> packedWeight = packInt8Words(weight);
+  std::vector<uint32_t> packedActual(outputCount / 4, 0);
+  if (test.kernel == 1) {
+    conv1x1_i8_kernel(packedX.data(), packedWeight.data(), bias.data(),
+        packedActual.data(), test.n, test.c, test.h, test.w, test.m,
+        test.xZeroPoint, test.wZeroPoint, test.multiplierBits,
+        test.outputZeroPoint);
+  } else {
+    conv3x3_i8_kernel(packedX.data(), packedWeight.data(), bias.data(),
+        packedActual.data(), test.n, test.c, test.h, test.w, test.m, ohSize,
+        owSize, test.pad, test.pad, test.stride, test.stride,
+        test.xZeroPoint, test.wZeroPoint, test.multiplierBits,
+        test.outputZeroPoint);
+  }
+  const std::vector<int8_t> actual =
+      unpackInt8Words(packedActual, outputCount);
 
   for (size_t i = 0; i < outputCount; ++i) {
     if (actual[i] != expected[i]) {
@@ -266,19 +302,45 @@ bool runCase(const ConvCase &test, std::mt19937 &generator) {
   return true;
 }
 
+bool testPackedShapeGuards() {
+  std::vector<uint32_t> x(64, 0);
+  std::vector<uint32_t> weight(64, 0);
+  std::vector<int32_t> bias(16, 0);
+  std::vector<uint32_t> output(64, 0xa5a5a5a5U);
+
+  conv1x1_i8_kernel(x.data(), weight.data(), bias.data(), output.data(), 1, 4,
+      1, 3, 4, 0, 0, 0x3f000000U, 0);
+  for (uint32_t value : output)
+    if (value != 0xa5a5a5a5U) {
+      std::fprintf(stderr, "FAIL INT8 1x1 packed-shape guard\n");
+      return false;
+    }
+
+  conv3x3_i8_kernel(x.data(), weight.data(), bias.data(), output.data(), 1, 4,
+      4, 5, 4, 4, 4, 1, 1, 1, 1, 0, 0, 0x3f000000U, 0);
+  for (uint32_t value : output)
+    if (value != 0xa5a5a5a5U) {
+      std::fprintf(stderr, "FAIL INT8 3x3 packed-shape guard\n");
+      return false;
+    }
+
+  std::printf("PASS %-30s\n", "INT8 packed-shape guards");
+  return true;
+}
+
 } // namespace
 
 int main() {
   const ConvCase tests[] = {
-      {"INT8 1x1 nonzero zero-points", 2, 5, 3, 4, 7, 1, 0, 1, 3, -5,
+      {"INT8 1x1 nonzero zero-points", 2, 8, 3, 4, 7, 1, 0, 1, 3, -5,
           0x3dcccccdU, 11},
-      {"INT8 1x1 channel/output tails", 1, 17, 4, 5, 19, 1, 0, 1, -7,
+      {"INT8 1x1 channel/output tails", 1, 20, 4, 5, 19, 1, 0, 1, -7,
           11, 0x3b800000U, -9},
-      {"INT8 1x1 multiplier above one", 1, 9, 2, 17, 17, 1, 0, 1, 0, 0,
+      {"INT8 1x1 multiplier above one", 1, 12, 2, 16, 17, 1, 0, 1, 0, 0,
           0x3fc00000U, 3},
-      {"INT8 3x3 stride1 edge tiles", 1, 3, 7, 6, 5, 3, 1, 1, 5, -9,
+      {"INT8 3x3 stride1 edge tiles", 1, 4, 7, 8, 5, 3, 1, 1, 5, -9,
           0x3a800000U, -7},
-      {"INT8 3x3 stride2 tails", 2, 5, 8, 9, 17, 3, 1, 2, -3, 6,
+      {"INT8 3x3 stride2 tails", 2, 8, 8, 16, 17, 3, 1, 2, -3, 6,
           0x39800000U, 13},
       {"INT8 3x3 max channel tail", 1, 128, 4, 4, 17, 3, 1, 1, 0, 0,
           0x38800000U, 0},
@@ -287,6 +349,7 @@ int main() {
   std::mt19937 generator(0x498);
   bool passed = testDirectedRequantization();
   passed = testFloatEmulationDifferential() && passed;
+  passed = testPackedShapeGuards() && passed;
   for (const ConvCase &test : tests)
     passed = runCase(test, generator) && passed;
   return passed ? 0 : 1;

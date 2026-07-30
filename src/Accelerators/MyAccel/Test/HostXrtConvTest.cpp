@@ -420,9 +420,9 @@ int main(int argc, char **argv) {
 
   if (argc < 2 || argc > 3) {
     std::fprintf(stderr,
-        "usage: %s <four-kernel.xclbin> "
-        "[--probe-only|--1x1-only|--3x3-only|--int8-only|"
-        "--int8-1x1-only|--int8-3x3-only]\n",
+        "usage: %s <xclbin> "
+        "[--probe-only|--1x1-only|--3x3-only|--int8-only|--int8-all|"
+        "--int8-1x1-only|--int8-3x3-only|--int8-6x6-only]\n",
         argv[0]);
     return 2;
   }
@@ -433,12 +433,17 @@ int main(int argc, char **argv) {
   const bool run3x3 = argc == 2 || std::strcmp(argv[2], "--3x3-only") == 0;
   const bool runInt8_1x1 = argc == 2 ||
       std::strcmp(argv[2], "--int8-only") == 0 ||
+      std::strcmp(argv[2], "--int8-all") == 0 ||
       std::strcmp(argv[2], "--int8-1x1-only") == 0;
   const bool runInt8_3x3 = argc == 2 ||
       std::strcmp(argv[2], "--int8-only") == 0 ||
+      std::strcmp(argv[2], "--int8-all") == 0 ||
       std::strcmp(argv[2], "--int8-3x3-only") == 0;
+  const bool runInt8_6x6 = argc == 2 ||
+      std::strcmp(argv[2], "--int8-all") == 0 ||
+      std::strcmp(argv[2], "--int8-6x6-only") == 0;
   if (!probeOnly && !run1x1 && !run3x3 && !runInt8_1x1 &&
-      !runInt8_3x3) {
+      !runInt8_3x3 && !runInt8_6x6) {
     std::fprintf(stderr, "error: unknown option: %s\n", argv[2]);
     return 2;
   }
@@ -469,6 +474,8 @@ int main(int argc, char **argv) {
       xrt::kernel conv3x3(device, uuid, "conv3x3_kernel");
       xrt::kernel conv1x1Int8(device, uuid, "conv1x1_i8_kernel");
       xrt::kernel conv3x3Int8(device, uuid, "conv3x3_i8_kernel");
+      xrt::kernel conv6x6StemInt8(
+          device, uuid, "conv6x6_stem_i8_kernel");
       std::printf("PASS loaded xclbin and opened all kernel handles\n");
       alarm(0);
       return 0;
@@ -492,7 +499,7 @@ int main(int argc, char **argv) {
     if (runInt8_1x1) {
       xrt::kernel kernel(device, uuid, "conv1x1_i8_kernel");
       const Int8ConvCase test = {
-          "conv1x1_i8_kernel", 1, 5, 4, 7, 17, 1, 0, 1, -7, 11,
+          "conv1x1_i8_kernel", 1, 4, 4, 7, 17, 1, 0, 1, -7, 11,
           0x3b000000U, -9};
       passed = runInt8Case(
                    device, kernel, test, generator, runTimeoutMs) &&
@@ -501,8 +508,17 @@ int main(int argc, char **argv) {
     if (runInt8_3x3) {
       xrt::kernel kernel(device, uuid, "conv3x3_i8_kernel");
       const Int8ConvCase test = {
-          "conv3x3_i8_kernel", 1, 5, 7, 6, 17, 3, 1, 2, -7, 11,
+          "conv3x3_i8_kernel", 1, 4, 7, 8, 17, 3, 1, 2, -7, 11,
           0x39800000U, 13};
+      passed = runInt8Case(
+                   device, kernel, test, generator, runTimeoutMs) &&
+          passed;
+    }
+    if (runInt8_6x6) {
+      xrt::kernel kernel(device, uuid, "conv6x6_stem_i8_kernel");
+      const Int8ConvCase test = {
+          "conv6x6_stem_i8_kernel", 1, 3, 8, 8, 7, 6, 2, 2, -7, 11,
+          0x39000000U, -3};
       passed = runInt8Case(
                    device, kernel, test, generator, runTimeoutMs) &&
           passed;

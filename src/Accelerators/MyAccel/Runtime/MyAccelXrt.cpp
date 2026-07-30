@@ -1,6 +1,7 @@
 #include "MyAccelXrt.h"
 #include "Conv1x1Int8Kernel.h"
 #include "Conv3x3Int8Kernel.h"
+#include "Conv6x6StemInt8Kernel.h"
 #include <cstdlib>
 #include <stdio.h>
 
@@ -78,10 +79,12 @@ struct XrtContext {
   std::unique_ptr<xrt::kernel> conv3x3Kernel;
   std::unique_ptr<xrt::kernel> conv1x1I8Kernel;
   std::unique_ptr<xrt::kernel> conv3x3I8Kernel;
+  std::unique_ptr<xrt::kernel> conv6x6StemI8Kernel;
   KernelBufferPool conv1x1Buffers;
   KernelBufferPool conv3x3Buffers;
   KernelBufferPool conv1x1I8Buffers;
   KernelBufferPool conv3x3I8Buffers;
+  KernelBufferPool conv6x6StemI8Buffers;
   std::mutex executionMutex;
 
   explicit XrtContext(const char *xclbin)
@@ -325,13 +328,22 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
     const bool is1x1 = kh_size == 1 && kw_size == 1 &&
         c_size <= MYACCEL_CONV1X1_INT8_MAX_INPUT_CHANNELS &&
         pad_left == 0 && pad_top == 0 && stride_h == 1 && stride_w == 1 &&
-        oh_size == h_size && ow_size == input_w_size;
+        oh_size == h_size && ow_size == input_w_size && c_size % 4 == 0 &&
+        ((uint64_t)h_size * input_w_size) % 4 == 0;
     const bool is3x3 = kh_size == 3 && kw_size == 3 &&
         c_size <= MYACCEL_CONV3X3_INT8_MAX_INPUT_CHANNELS &&
         pad_left >= 0 && pad_top >= 0 &&
         stride_h > 0 && stride_h <= MYACCEL_CONV3X3_INT8_MAX_STRIDE &&
-        stride_w > 0 && stride_w <= MYACCEL_CONV3X3_INT8_MAX_STRIDE;
-    if (!is1x1 && !is3x3)
+        stride_w > 0 && stride_w <= MYACCEL_CONV3X3_INT8_MAX_STRIDE &&
+        c_size % 4 == 0 && input_w_size % 4 == 0 && ow_size % 4 == 0;
+    const bool is6x6 = envFlagEnabled("MYACCEL_ENABLE_6X6_STEM") &&
+        kh_size == 6 && kw_size == 6 &&
+        c_size <= MYACCEL_CONV6X6_STEM_INT8_MAX_INPUT_CHANNELS &&
+        pad_left >= 0 && pad_top >= 0 && stride_h > 0 &&
+        stride_h <= MYACCEL_CONV6X6_STEM_INT8_MAX_STRIDE && stride_w > 0 &&
+        stride_w <= MYACCEL_CONV6X6_STEM_INT8_MAX_STRIDE &&
+        input_w_size % 4 == 0 && ow_size % 4 == 0;
+    if (!is1x1 && !is3x3 && !is6x6)
       return 0;
 
     const auto contextStart = Clock::now();
@@ -347,10 +359,14 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
       kernelSlot = &ctx->conv1x1I8Kernel;
       persistentPool = &ctx->conv1x1I8Buffers;
       kernelName = "conv1x1_i8_kernel";
-    } else {
+    } else if (is3x3) {
       kernelSlot = &ctx->conv3x3I8Kernel;
       persistentPool = &ctx->conv3x3I8Buffers;
       kernelName = "conv3x3_i8_kernel";
+    } else {
+      kernelSlot = &ctx->conv6x6StemI8Kernel;
+      persistentPool = &ctx->conv6x6StemI8Buffers;
+      kernelName = "conv6x6_stem_i8_kernel";
     }
 
     size_t xBytes =
@@ -415,7 +431,7 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
     Clock::time_point submitEnd;
     Clock::time_point waitStart;
     Clock::time_point waitEnd;
-    if (kh_size == 1) {
+    if (is1x1) {
       auto run = (*kernel)(xBo, wBo, bBo, yBo, n_size, c_size, h_size,
           input_w_size, m_size, x_zero_point, w_zero_point,
           requant_multiplier_bits, output_zero_point);
