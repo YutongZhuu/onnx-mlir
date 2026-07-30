@@ -12,7 +12,9 @@
 #endif
 
 #include "Conv1x1Kernel.h"
+#include "Conv1x1Int8Kernel.h"
 #include "Conv3x3Kernel.h"
+#include "Conv3x3Int8Kernel.h"
 #include "MyAccelXrt.h"
 #include "onnx-mlir/Runtime/OMTensor.h"
 
@@ -68,12 +70,17 @@ static void set_reason(char *reason, size_t reasonSize, const char *text) {
   snprintf(reason, reasonSize, "%s", text);
 }
 
+static int force_cpu_requested(void) {
+  const char *cpu = getenv("CPU");
+  return (cpu && strcmp(cpu, "1") == 0) || getenv("MYACCEL_FORCE_CPU");
+}
+
 static int check_support(const int64_t *xs, const int64_t *ws,
     const int64_t *ys, int64_t dh, int64_t dw, int64_t group, int64_t sh,
     int64_t sw, int64_t padLeft, int64_t padTop, char *reason,
     size_t reasonSize) {
-  if (getenv("MYACCEL_FORCE_CPU")) {
-    set_reason(reason, reasonSize, "MYACCEL_FORCE_CPU is set");
+  if (force_cpu_requested()) {
+    set_reason(reason, reasonSize, "CPU=1 or MYACCEL_FORCE_CPU is set");
     return 0;
   }
   if (dh != 1 || dw != 1 || group != 1 || sh <= 0 || sw <= 0) {
@@ -162,6 +169,100 @@ static int check_support(const int64_t *xs, const int64_t *ws,
   return 1;
 }
 
+static int check_i8_support(const int64_t *xs, const int64_t *ws,
+    const int64_t *ys, int64_t dh, int64_t dw, int64_t group, int64_t sh,
+    int64_t sw, int64_t padLeft, int64_t padTop, char *reason,
+    size_t reasonSize) {
+  if (force_cpu_requested()) {
+    set_reason(reason, reasonSize, "CPU=1 or MYACCEL_FORCE_CPU is set");
+    return 0;
+  }
+  if (dh != 1 || dw != 1 || group != 1 || sh <= 0 || sw <= 0 ||
+      padLeft < 0 || padTop < 0) {
+    set_reason(reason, reasonSize,
+        "unsupported dilation, group/depthwise conv, or stride");
+    return 0;
+  }
+  for (int i = 0; i < 4; ++i) {
+    if (xs[i] <= 0 || ws[i] <= 0 || ys[i] <= 0) {
+      set_reason(reason, reasonSize, "invalid tensor metadata");
+      return 0;
+    }
+    if (!value_fits_int(xs[i]) || !value_fits_int(ws[i]) ||
+        !value_fits_int(ys[i])) {
+      set_reason(reason, reasonSize, "tensor dimension does not fit int ABI");
+      return 0;
+    }
+  }
+  if (!value_fits_int(dh) || !value_fits_int(dw) || !value_fits_int(group) ||
+      !value_fits_int(sh) || !value_fits_int(sw) ||
+      !value_fits_int(padLeft) || !value_fits_int(padTop)) {
+    set_reason(reason, reasonSize, "metadata does not fit int ABI");
+    return 0;
+  }
+  if (!product_fits_uint32(xs[0], xs[1], xs[2], xs[3]) ||
+      !product_fits_uint32(ws[0], ws[1], ws[2], ws[3]) ||
+      !product_fits_uint32(ys[0], ys[1], ys[2], ys[3])) {
+    set_reason(reason, reasonSize, "tensor element count exceeds XRT ABI");
+    return 0;
+  }
+  if (xs[1] != ws[1] || ys[0] != xs[0] || ys[1] != ws[0]) {
+    set_reason(reason, reasonSize, "inconsistent Conv tensor shapes");
+    return 0;
+  }
+
+  const int is1x1 = ws[2] == 1 && ws[3] == 1;
+  const int is3x3 = ws[2] == 3 && ws[3] == 3;
+  if (!is1x1 && !is3x3) {
+    set_reason(reason, reasonSize,
+        "only 1x1 and 3x3 INT8 kernels are supported");
+    return 0;
+  }
+  if (is1x1 &&
+      (xs[1] > MYACCEL_CONV1X1_INT8_MAX_INPUT_CHANNELS || sh != 1 ||
+          sw != 1 || padLeft != 0 || padTop != 0 || ys[2] != xs[2] ||
+          ys[3] != xs[3])) {
+    set_reason(reason, reasonSize,
+        "INT8 1x1 convolution exceeds channel limit or requires "
+        "padding/stride");
+    return 0;
+  }
+  if (is3x3 &&
+      (xs[1] > MYACCEL_CONV3X3_INT8_MAX_INPUT_CHANNELS ||
+          sh > MYACCEL_CONV3X3_INT8_MAX_STRIDE ||
+          sw > MYACCEL_CONV3X3_INT8_MAX_STRIDE)) {
+    set_reason(reason, reasonSize,
+        "INT8 3x3 convolution exceeds channel or stride limit");
+    return 0;
+  }
+
+  const int64_t maxOutputPixels =
+      read_nonnegative_env_i64("MYACCEL_MAX_OUTPUT_PIXELS", 80 * 80);
+  if (maxOutputPixels > 0 && ys[2] * ys[3] > maxOutputPixels) {
+    snprintf(reason, reasonSize,
+        "output spatial size %lld exceeds MYACCEL_MAX_OUTPUT_PIXELS=%lld",
+        (long long)(ys[2] * ys[3]), (long long)maxOutputPixels);
+    return 0;
+  }
+
+  const int64_t maxIoBytes =
+      read_nonnegative_env_i64("MYACCEL_MAX_IO_BYTES", 32 * 1024 * 1024);
+  const uint64_t xBytes = tensor_elems_4d(xs) * sizeof(int8_t);
+  const uint64_t wBytes = tensor_elems_4d(ws) * sizeof(int8_t);
+  const uint64_t yBytes = tensor_elems_4d(ys) * sizeof(int32_t);
+  const uint64_t totalBytes = xBytes + wBytes + yBytes;
+  if (maxIoBytes > 0 && totalBytes > (uint64_t)maxIoBytes) {
+    snprintf(reason, reasonSize,
+        "total INT8 accelerator IO bytes %llu exceeds "
+        "MYACCEL_MAX_IO_BYTES=%lld",
+        (unsigned long long)totalBytes, (long long)maxIoBytes);
+    return 0;
+  }
+
+  set_reason(reason, reasonSize, "supported");
+  return 1;
+}
+
 static void my_conv_f32_cpu_fallback(float *y, const float *x, const float *w,
     const float *b, const int64_t *xs, const int64_t *ws, const int64_t *ys,
     int64_t dh, int64_t dw, int64_t group, int64_t padLeft, int64_t padTop,
@@ -224,8 +325,9 @@ static int8_t requantize_i8(int32_t sum, int32_t bias, int32_t biasZeroPoint,
   return (int8_t)quantized;
 }
 
-// Compute a QDQ-wrapped INT8 convolution and directly requantize its int32
-// accumulator to the output QuantizeLinear's signed-int8 representation.
+// Compute a QDQ-wrapped INT8 convolution. Supported 1x1 and 3x3 layers send
+// only the centered INT8 dot products to XRT; bias and requantization stay on
+// the host. Other kernel sizes and CPU=1 use the host implementation below.
 // NCHW input and OIHW weights are assumed.
 void my_conv_qdq_i8(OMTensor *yTensor, const OMTensor *xTensor,
     const OMTensor *xScaleTensor, const OMTensor *xZeroPointTensor,
@@ -267,7 +369,8 @@ void my_conv_qdq_i8(OMTensor *yTensor, const OMTensor *xTensor,
       dw == 1 && sh == 1 && sw == 1 && padTop == 0 && padLeft == 0 &&
       ohSize == hSize && owSize == wSize;
 
-  if (getenv("MYACCEL_PROFILE"))
+  const int profile = getenv("MYACCEL_PROFILE") != NULL;
+  if (profile)
     fprintf(stderr,
         "MYACCEL_INT8 shape=%lldx%lldx%lldx%lld->%lldx%lldx%lld "
         "kernel=%lldx%lld stride=%lldx%lld direct=%d\n",
@@ -275,6 +378,57 @@ void my_conv_qdq_i8(OMTensor *yTensor, const OMTensor *xTensor,
         (long long)wSize, (long long)mSize, (long long)ohSize,
         (long long)owSize, (long long)khSize, (long long)kwSize,
         (long long)sh, (long long)sw, directOneByOne);
+
+  char reason[160];
+  if (check_i8_support(xs, ws, ys, dh, dw, group, sh, sw, padLeft, padTop,
+          reason, sizeof(reason))) {
+    const size_t accumulatorCount = (size_t)tensor_elems_4d(ys);
+    int32_t *accumulator =
+        (int32_t *)malloc(accumulatorCount * sizeof(int32_t));
+    if (accumulator) {
+      if (profile)
+        fprintf(stderr,
+            "MYACCEL_INT8 routing convolution dot products to XRT: %s\n",
+            reason);
+      const double xrtStart = now_seconds();
+      if (myaccel_xrt_conv2d_i8(x, w, accumulator, (int)nSize, (int)cSize,
+              (int)hSize, (int)wSize, (int)mSize, (int)khSize, (int)kwSize,
+              (int)ohSize, (int)owSize, (int)dh, (int)dw, (int)cPerGroup,
+              (int)group, (int)padLeft, (int)padTop, (int)sh, (int)sw,
+              (int)xZeroPoint, (int)wZeroPoint)) {
+        const double xrtEnd = now_seconds();
+        for (int64_t n = 0; n < nSize; ++n)
+          for (int64_t m = 0; m < mSize; ++m)
+            for (int64_t position = 0; position < spatialSize; ++position) {
+              const int64_t index =
+                  (n * mSize + m) * spatialSize + position;
+              y[index] = requantize_i8(accumulator[index], b ? b[m] : 0,
+                  bZeroPoint, productScale, bScale, yScale, yZeroPoint);
+            }
+        const double requantEnd = now_seconds();
+        free(accumulator);
+        if (profile)
+          fprintf(stderr,
+              "MYACCEL_INT8_PROFILE xrt_dot_products=%.6f "
+              "host_requantization=%.6f total=%.6f s\n",
+              xrtEnd - xrtStart, requantEnd - xrtEnd,
+              requantEnd - xrtStart);
+        return;
+      }
+      free(accumulator);
+      if (profile)
+        fprintf(stderr,
+            "MYACCEL_INT8 XRT path failed after %.6f s; using host "
+            "convolution\n",
+            now_seconds() - xrtStart);
+    } else if (profile) {
+      fprintf(stderr,
+          "MYACCEL_INT8 could not allocate the host accumulator; using host "
+          "convolution\n");
+    }
+  } else if (profile) {
+    fprintf(stderr, "MYACCEL_INT8 routing convolution to host: %s\n", reason);
+  }
 
   int8_t *columns = 0;
   if (!directOneByOne) {

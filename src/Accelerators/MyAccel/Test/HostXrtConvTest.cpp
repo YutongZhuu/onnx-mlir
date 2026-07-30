@@ -3,6 +3,7 @@
 #include <csignal>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -237,6 +238,141 @@ bool runCase(xrt::device &device, xrt::kernel &kernel,
   return true;
 }
 
+struct Int8ConvCase {
+  const char *name;
+  int n;
+  int c;
+  int h;
+  int w;
+  int m;
+  int kernel;
+  int pad;
+  int stride;
+  int xZeroPoint;
+  int wZeroPoint;
+};
+
+bool runInt8Case(xrt::device &device, xrt::kernel &kernel,
+    const Int8ConvCase &test, std::mt19937 &generator,
+    unsigned int runTimeoutMs) {
+  const int ohSize =
+      (test.h + 2 * test.pad - test.kernel) / test.stride + 1;
+  const int owSize =
+      (test.w + 2 * test.pad - test.kernel) / test.stride + 1;
+  const size_t xCount = (size_t)test.n * test.c * test.h * test.w;
+  const size_t weightCount =
+      (size_t)test.m * test.c * test.kernel * test.kernel;
+  const size_t outputCount =
+      (size_t)test.n * test.m * ohSize * owSize;
+  const size_t xBytes = xCount * sizeof(int8_t);
+  const size_t weightBytes = weightCount * sizeof(int8_t);
+  const size_t outputBytes = outputCount * sizeof(int32_t);
+
+  std::uniform_int_distribution<int> distribution(-128, 127);
+  std::vector<int8_t> x(xCount);
+  std::vector<int8_t> weight(weightCount);
+  std::vector<int32_t> expected(outputCount);
+  std::vector<int32_t> actual(outputCount, INT32_MIN);
+  for (int8_t &value : x)
+    value = (int8_t)distribution(generator);
+  for (int8_t &value : weight)
+    value = (int8_t)distribution(generator);
+
+  for (int n = 0; n < test.n; ++n)
+    for (int m = 0; m < test.m; ++m)
+      for (int oh = 0; oh < ohSize; ++oh)
+        for (int ow = 0; ow < owSize; ++ow) {
+          int32_t sum = 0;
+          for (int c = 0; c < test.c; ++c)
+            for (int kh = 0; kh < test.kernel; ++kh)
+              for (int kw = 0; kw < test.kernel; ++kw) {
+                const int ih = oh * test.stride + kh - test.pad;
+                const int iw = ow * test.stride + kw - test.pad;
+                int32_t input = test.xZeroPoint;
+                if (ih >= 0 && ih < test.h && iw >= 0 && iw < test.w) {
+                  const size_t xIndex =
+                      ((size_t)n * test.c + c) * test.h * test.w +
+                      (size_t)ih * test.w + iw;
+                  input = x[xIndex];
+                }
+                const size_t weightIndex =
+                    (((size_t)m * test.c + c) * test.kernel + kh) *
+                        test.kernel +
+                    kw;
+                sum += (input - test.xZeroPoint) *
+                       ((int32_t)weight[weightIndex] - test.wZeroPoint);
+              }
+          const size_t outputIndex =
+              ((size_t)n * test.m + m) * ohSize * owSize +
+              (size_t)oh * owSize + ow;
+          expected[outputIndex] = sum;
+        }
+
+  const auto allocationStart = Clock::now();
+  xrt::bo xBo(device, xBytes, kernel.group_id(0));
+  xrt::bo weightBo(device, weightBytes, kernel.group_id(1));
+  xrt::bo outputBo(device, outputBytes, kernel.group_id(2));
+  const auto allocationEnd = Clock::now();
+
+  const auto writeStart = Clock::now();
+  xBo.write(x.data(), xBytes, 0);
+  weightBo.write(weight.data(), weightBytes, 0);
+  const auto writeEnd = Clock::now();
+
+  const auto h2dStart = Clock::now();
+  xBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  weightBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  const auto h2dEnd = Clock::now();
+
+  const auto waitStart = Clock::now();
+  ert_cmd_state state;
+  if (test.kernel == 1) {
+    auto run = kernel(xBo, weightBo, outputBo, test.n, test.c, test.h, test.w,
+        test.m, test.xZeroPoint, test.wZeroPoint);
+    state = run.wait(runTimeoutMs);
+    if (state == ERT_CMD_STATE_TIMEOUT)
+      (void)run.abort();
+  } else {
+    auto run = kernel(xBo, weightBo, outputBo, test.n, test.c, test.h, test.w,
+        test.m, ohSize, owSize, test.pad, test.pad, test.stride, test.stride,
+        test.xZeroPoint, test.wZeroPoint);
+    state = run.wait(runTimeoutMs);
+    if (state == ERT_CMD_STATE_TIMEOUT)
+      (void)run.abort();
+  }
+  const auto waitEnd = Clock::now();
+  if (state != ERT_CMD_STATE_COMPLETED) {
+    std::fprintf(stderr, "FAIL %s returned state=%s(%d)\n", test.name,
+        stateName(state), (int)state);
+    return false;
+  }
+
+  const auto d2hStart = Clock::now();
+  outputBo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  const auto d2hEnd = Clock::now();
+  const auto readStart = Clock::now();
+  outputBo.read(actual.data(), outputBytes, 0);
+  const auto readEnd = Clock::now();
+
+  for (size_t i = 0; i < outputCount; ++i) {
+    if (actual[i] != expected[i]) {
+      std::fprintf(stderr, "FAIL %s at %zu: expected %d, got %d\n",
+          test.name, i, expected[i], actual[i]);
+      return false;
+    }
+  }
+
+  std::printf(
+      "PASS %s exact_int32_outputs=%zu\n"
+      "  bo_alloc=%8.3f ms  host_write=%8.3f ms  h2d_sync=%8.3f ms\n"
+      "  run_wait=%8.3f ms  d2h_sync=%8.3f ms  host_read=%8.3f ms\n",
+      test.name, outputCount, milliseconds(allocationStart, allocationEnd),
+      milliseconds(writeStart, writeEnd), milliseconds(h2dStart, h2dEnd),
+      milliseconds(waitStart, waitEnd), milliseconds(d2hStart, d2hEnd),
+      milliseconds(readStart, readEnd));
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -245,8 +381,9 @@ int main(int argc, char **argv) {
 
   if (argc < 2 || argc > 3) {
     std::fprintf(stderr,
-        "usage: %s <two-kernel.xclbin> "
-        "[--probe-only|--1x1-only|--3x3-only]\n",
+        "usage: %s <four-kernel.xclbin> "
+        "[--probe-only|--1x1-only|--3x3-only|--int8-only|"
+        "--int8-1x1-only|--int8-3x3-only]\n",
         argv[0]);
     return 2;
   }
@@ -255,7 +392,14 @@ int main(int argc, char **argv) {
       argc == 3 && std::strcmp(argv[2], "--probe-only") == 0;
   const bool run1x1 = argc == 2 || std::strcmp(argv[2], "--1x1-only") == 0;
   const bool run3x3 = argc == 2 || std::strcmp(argv[2], "--3x3-only") == 0;
-  if (!probeOnly && !run1x1 && !run3x3) {
+  const bool runInt8_1x1 = argc == 2 ||
+      std::strcmp(argv[2], "--int8-only") == 0 ||
+      std::strcmp(argv[2], "--int8-1x1-only") == 0;
+  const bool runInt8_3x3 = argc == 2 ||
+      std::strcmp(argv[2], "--int8-only") == 0 ||
+      std::strcmp(argv[2], "--int8-3x3-only") == 0;
+  if (!probeOnly && !run1x1 && !run3x3 && !runInt8_1x1 &&
+      !runInt8_3x3) {
     std::fprintf(stderr, "error: unknown option: %s\n", argv[2]);
     return 2;
   }
@@ -284,7 +428,9 @@ int main(int argc, char **argv) {
     if (probeOnly) {
       xrt::kernel conv1x1(device, uuid, "conv1x1_kernel");
       xrt::kernel conv3x3(device, uuid, "conv3x3_kernel");
-      std::printf("PASS loaded xclbin and opened both kernel handles\n");
+      xrt::kernel conv1x1Int8(device, uuid, "conv1x1_i8_kernel");
+      xrt::kernel conv3x3Int8(device, uuid, "conv3x3_i8_kernel");
+      std::printf("PASS loaded xclbin and opened all kernel handles\n");
       alarm(0);
       return 0;
     }
@@ -303,6 +449,22 @@ int main(int argc, char **argv) {
           "conv3x3_kernel", 1, 5, 7, 6, 17, 3, 1, 2, true};
       passed =
           runCase(device, kernel, test, generator, runTimeoutMs) && passed;
+    }
+    if (runInt8_1x1) {
+      xrt::kernel kernel(device, uuid, "conv1x1_i8_kernel");
+      const Int8ConvCase test = {
+          "conv1x1_i8_kernel", 1, 5, 4, 7, 17, 1, 0, 1, -7, 11};
+      passed = runInt8Case(
+                   device, kernel, test, generator, runTimeoutMs) &&
+          passed;
+    }
+    if (runInt8_3x3) {
+      xrt::kernel kernel(device, uuid, "conv3x3_i8_kernel");
+      const Int8ConvCase test = {
+          "conv3x3_i8_kernel", 1, 5, 7, 6, 17, 3, 1, 2, -7, 11};
+      passed = runInt8Case(
+                   device, kernel, test, generator, runTimeoutMs) &&
+          passed;
     }
     alarm(0);
     return passed ? 0 : 1;

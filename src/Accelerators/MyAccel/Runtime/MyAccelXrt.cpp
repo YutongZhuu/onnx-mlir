@@ -1,4 +1,6 @@
 #include "MyAccelXrt.h"
+#include "Conv1x1Int8Kernel.h"
+#include "Conv3x3Int8Kernel.h"
 #include <cstdlib>
 #include <stdio.h>
 
@@ -7,6 +9,13 @@
 extern "C" int myaccel_xrt_conv2d_f32(const float *, const float *,
     const float *, float *, int, int, int, int, int, int, int, int, int, int,
     int, int, int, int, int, int, int, int) {
+  fprintf(stderr, "MYACCEL: XRT support not compiled in\n");
+  return 0;
+}
+
+extern "C" int myaccel_xrt_conv2d_i8(const int8_t *, const int8_t *,
+    int32_t *, int, int, int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, int) {
   fprintf(stderr, "MYACCEL: XRT support not compiled in\n");
   return 0;
 }
@@ -65,16 +74,18 @@ struct KernelBufferPool {
 struct XrtContext {
   xrt::device device;
   xrt::uuid uuid;
-  xrt::kernel conv1x1Kernel;
-  xrt::kernel conv3x3Kernel;
+  std::unique_ptr<xrt::kernel> conv1x1Kernel;
+  std::unique_ptr<xrt::kernel> conv3x3Kernel;
+  std::unique_ptr<xrt::kernel> conv1x1I8Kernel;
+  std::unique_ptr<xrt::kernel> conv3x3I8Kernel;
   KernelBufferPool conv1x1Buffers;
   KernelBufferPool conv3x3Buffers;
+  KernelBufferPool conv1x1I8Buffers;
+  KernelBufferPool conv3x3I8Buffers;
   std::mutex executionMutex;
 
   explicit XrtContext(const char *xclbin)
-      : device(0), uuid(device.load_xclbin(xclbin)),
-        conv1x1Kernel(device, uuid, "conv1x1_kernel"),
-        conv3x3Kernel(device, uuid, "conv3x3_kernel") {}
+      : device(0), uuid(device.load_xclbin(xclbin)) {}
 };
 
 std::unique_ptr<XrtContext> g_ctx;
@@ -94,8 +105,7 @@ XrtContext *getContext() {
   fprintf(stderr, "MYACCEL: loading xclbin: %s\n", xclbin);
   const auto start = Clock::now();
   g_ctx = std::make_unique<XrtContext>(xclbin);
-  fprintf(stderr,
-      "MYACCEL: loaded xclbin and opened both convolution kernels in %.3f ms\n",
+  fprintf(stderr, "MYACCEL: loaded xclbin in %.3f ms\n",
       milliseconds(start, Clock::now()));
   return g_ctx.get();
 }
@@ -121,15 +131,15 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
         c_per_group != c_size)
       return 0;
 
-    xrt::kernel *kernel = nullptr;
+    std::unique_ptr<xrt::kernel> *kernelSlot = nullptr;
     KernelBufferPool *persistentPool = nullptr;
     const char *kernelName = nullptr;
     if (kh_size == 1 && kw_size == 1) {
-      kernel = &ctx->conv1x1Kernel;
+      kernelSlot = &ctx->conv1x1Kernel;
       persistentPool = &ctx->conv1x1Buffers;
       kernelName = "conv1x1_kernel";
     } else if (kh_size == 3 && kw_size == 3) {
-      kernel = &ctx->conv3x3Kernel;
+      kernelSlot = &ctx->conv3x3Kernel;
       persistentPool = &ctx->conv3x3Buffers;
       kernelName = "conv3x3_kernel";
     } else {
@@ -151,6 +161,12 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
     const auto queueStart = Clock::now();
     std::lock_guard<std::mutex> executionLock(ctx->executionMutex);
     const auto queueEnd = Clock::now();
+    const auto kernelOpenStart = Clock::now();
+    if (!*kernelSlot)
+      *kernelSlot =
+          std::make_unique<xrt::kernel>(ctx->device, ctx->uuid, kernelName);
+    xrt::kernel *kernel = kernelSlot->get();
+    const auto kernelOpenEnd = Clock::now();
 
     // When pooling is disabled, these BOs are destroyed at the end of this
     // call. This provides an A/B comparison using the same runtime binary.
@@ -240,7 +256,7 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
       fprintf(stderr,
           "MYACCEL_PROFILE kernel=%s shape=%dx%dx%dx%d->%dx%dx%d "
           "bytes=x:%zu,w:%zu,b:%zu,y:%zu pool=%s alloc_mask=0x%x "
-          "context=%.3f queue=%.3f alloc=%.3f "
+          "context=%.3f queue=%.3f kernel_open=%.3f alloc=%.3f "
           "x_write=%.3f w_write=%.3f b_write=%.3f "
           "x_sync=%.3f w_sync=%.3f b_sync=%.3f "
           "submit=%.3f wait=%.3f kernel_total=%.3f "
@@ -250,6 +266,7 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
           useBufferPool ? "on" : "off", allocationMask,
           milliseconds(contextStart, contextEnd),
           milliseconds(queueStart, queueEnd),
+          milliseconds(kernelOpenStart, kernelOpenEnd),
           milliseconds(allocationStart, allocationEnd),
           milliseconds(xWriteStart, xWriteEnd),
           milliseconds(wWriteStart, wWriteEnd),
@@ -267,6 +284,166 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
     return 1;
   } catch (const std::exception &e) {
     fprintf(stderr, "MYACCEL: XRT conv failed: %s\n", e.what());
+    return 0;
+  }
+}
+
+extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
+    int32_t *accumulator, int n_size, int c_size, int h_size,
+    int input_w_size, int m_size, int kh_size, int kw_size, int oh_size,
+    int ow_size, int dilation_h, int dilation_w, int c_per_group, int group,
+    int pad_left, int pad_top, int stride_h, int stride_w,
+    int x_zero_point, int w_zero_point) {
+  try {
+    const bool profile = envFlagEnabled("MYACCEL_PROFILE");
+    const bool useBufferPool =
+        !envFlagEnabled("MYACCEL_DISABLE_BO_POOL");
+    const auto totalStart = Clock::now();
+    if (!x || !weight || !accumulator || n_size <= 0 || c_size <= 0 ||
+        h_size <= 0 || input_w_size <= 0 || m_size <= 0 || oh_size <= 0 ||
+        ow_size <= 0)
+      return 0;
+    if (dilation_h != 1 || dilation_w != 1 || group != 1 ||
+        c_per_group != c_size)
+      return 0;
+
+    const bool is1x1 = kh_size == 1 && kw_size == 1 &&
+        c_size <= MYACCEL_CONV1X1_INT8_MAX_INPUT_CHANNELS &&
+        pad_left == 0 && pad_top == 0 && stride_h == 1 && stride_w == 1 &&
+        oh_size == h_size && ow_size == input_w_size;
+    const bool is3x3 = kh_size == 3 && kw_size == 3 &&
+        c_size <= MYACCEL_CONV3X3_INT8_MAX_INPUT_CHANNELS &&
+        pad_left >= 0 && pad_top >= 0 &&
+        stride_h > 0 && stride_h <= MYACCEL_CONV3X3_INT8_MAX_STRIDE &&
+        stride_w > 0 && stride_w <= MYACCEL_CONV3X3_INT8_MAX_STRIDE;
+    if (!is1x1 && !is3x3)
+      return 0;
+
+    const auto contextStart = Clock::now();
+    XrtContext *ctx = getContext();
+    const auto contextEnd = Clock::now();
+    if (!ctx)
+      return 0;
+
+    std::unique_ptr<xrt::kernel> *kernelSlot = nullptr;
+    KernelBufferPool *persistentPool = nullptr;
+    const char *kernelName = nullptr;
+    if (is1x1) {
+      kernelSlot = &ctx->conv1x1I8Kernel;
+      persistentPool = &ctx->conv1x1I8Buffers;
+      kernelName = "conv1x1_i8_kernel";
+    } else {
+      kernelSlot = &ctx->conv3x3I8Kernel;
+      persistentPool = &ctx->conv3x3I8Buffers;
+      kernelName = "conv3x3_i8_kernel";
+    }
+
+    size_t xBytes =
+        (size_t)n_size * c_size * h_size * input_w_size * sizeof(int8_t);
+    size_t wBytes = (size_t)m_size * c_per_group * kh_size * kw_size *
+                    sizeof(int8_t);
+    size_t yBytes =
+        (size_t)n_size * m_size * oh_size * ow_size * sizeof(int32_t);
+
+    const auto queueStart = Clock::now();
+    std::lock_guard<std::mutex> executionLock(ctx->executionMutex);
+    const auto queueEnd = Clock::now();
+    const auto kernelOpenStart = Clock::now();
+    if (!*kernelSlot)
+      *kernelSlot =
+          std::make_unique<xrt::kernel>(ctx->device, ctx->uuid, kernelName);
+    xrt::kernel *kernel = kernelSlot->get();
+    const auto kernelOpenEnd = Clock::now();
+
+    KernelBufferPool transientPool;
+    KernelBufferPool &buffers =
+        useBufferPool ? *persistentPool : transientPool;
+
+    const auto allocationStart = Clock::now();
+    int allocationMask = 0;
+    if (buffers.input.ensure(ctx->device, xBytes, kernel->group_id(0)))
+      allocationMask |= 1;
+    if (buffers.weight.ensure(ctx->device, wBytes, kernel->group_id(1)))
+      allocationMask |= 2;
+    if (buffers.output.ensure(ctx->device, yBytes, kernel->group_id(2)))
+      allocationMask |= 4;
+    const auto allocationEnd = Clock::now();
+
+    xrt::bo &xBo = buffers.input.get();
+    xrt::bo &wBo = buffers.weight.get();
+    xrt::bo &yBo = buffers.output.get();
+
+    const auto xWriteStart = Clock::now();
+    xBo.write(x, xBytes, 0);
+    const auto xWriteEnd = Clock::now();
+    const auto wWriteStart = Clock::now();
+    wBo.write(weight, wBytes, 0);
+    const auto wWriteEnd = Clock::now();
+
+    const auto xSyncStart = Clock::now();
+    xBo.sync(XCL_BO_SYNC_BO_TO_DEVICE, xBytes, 0);
+    const auto xSyncEnd = Clock::now();
+    const auto wSyncStart = Clock::now();
+    wBo.sync(XCL_BO_SYNC_BO_TO_DEVICE, wBytes, 0);
+    const auto wSyncEnd = Clock::now();
+
+    const auto submitStart = Clock::now();
+    Clock::time_point submitEnd;
+    Clock::time_point waitStart;
+    Clock::time_point waitEnd;
+    if (kh_size == 1) {
+      auto run = (*kernel)(xBo, wBo, yBo, n_size, c_size, h_size,
+          input_w_size, m_size, x_zero_point, w_zero_point);
+      submitEnd = Clock::now();
+      waitStart = Clock::now();
+      run.wait();
+      waitEnd = Clock::now();
+    } else {
+      auto run = (*kernel)(xBo, wBo, yBo, n_size, c_size, h_size,
+          input_w_size, m_size, oh_size, ow_size, pad_left, pad_top,
+          stride_h, stride_w, x_zero_point, w_zero_point);
+      submitEnd = Clock::now();
+      waitStart = Clock::now();
+      run.wait();
+      waitEnd = Clock::now();
+    }
+
+    const auto ySyncStart = Clock::now();
+    yBo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, yBytes, 0);
+    const auto ySyncEnd = Clock::now();
+    const auto readStart = Clock::now();
+    yBo.read(accumulator, yBytes, 0);
+    const auto readEnd = Clock::now();
+
+    if (profile) {
+      fprintf(stderr,
+          "MYACCEL_PROFILE kernel=%s "
+          "shape=%dx%dx%dx%d->%dx%dx%d kernel_shape=%dx%d "
+          "bytes=x:%zu,w:%zu,y:%zu pool=%s alloc_mask=0x%x "
+          "context=%.3f queue=%.3f kernel_open=%.3f alloc=%.3f "
+          "x_write=%.3f w_write=%.3f x_sync=%.3f w_sync=%.3f "
+          "submit=%.3f wait=%.3f kernel_total=%.3f "
+          "y_sync=%.3f read=%.3f total=%.3f ms\n",
+          kernelName, n_size, c_size, h_size, input_w_size, m_size, oh_size,
+          ow_size, kh_size, kw_size, xBytes, wBytes, yBytes,
+          useBufferPool ? "on" : "off", allocationMask,
+          milliseconds(contextStart, contextEnd),
+          milliseconds(queueStart, queueEnd),
+          milliseconds(kernelOpenStart, kernelOpenEnd),
+          milliseconds(allocationStart, allocationEnd),
+          milliseconds(xWriteStart, xWriteEnd),
+          milliseconds(wWriteStart, wWriteEnd),
+          milliseconds(xSyncStart, xSyncEnd),
+          milliseconds(wSyncStart, wSyncEnd),
+          milliseconds(submitStart, submitEnd),
+          milliseconds(waitStart, waitEnd),
+          milliseconds(submitStart, waitEnd),
+          milliseconds(ySyncStart, ySyncEnd),
+          milliseconds(readStart, readEnd), milliseconds(totalStart, readEnd));
+    }
+    return 1;
+  } catch (const std::exception &e) {
+    fprintf(stderr, "MYACCEL: XRT INT8 conv failed: %s\n", e.what());
     return 0;
   }
 }
