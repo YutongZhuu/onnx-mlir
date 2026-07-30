@@ -14,8 +14,8 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *, const float *,
 }
 
 extern "C" int myaccel_xrt_conv2d_i8(const int8_t *, const int8_t *,
-    int32_t *, int, int, int, int, int, int, int, int, int, int, int, int,
-    int, int, int, int, int, int, int) {
+    const int32_t *, int8_t *, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, int, int, int, int, uint32_t, int) {
   fprintf(stderr, "MYACCEL: XRT support not compiled in\n");
   return 0;
 }
@@ -91,6 +91,11 @@ struct XrtContext {
 std::unique_ptr<XrtContext> g_ctx;
 std::mutex g_contextMutex;
 
+void releaseContextAtExit() {
+  std::lock_guard<std::mutex> lock(g_contextMutex);
+  g_ctx.reset();
+}
+
 XrtContext *getContext() {
   std::lock_guard<std::mutex> lock(g_contextMutex);
   if (g_ctx)
@@ -105,6 +110,15 @@ XrtContext *getContext() {
   fprintf(stderr, "MYACCEL: loading xclbin: %s\n", xclbin);
   const auto start = Clock::now();
   g_ctx = std::make_unique<XrtContext>(xclbin);
+  static const bool cleanupRegistered = []() {
+    if (std::atexit(releaseContextAtExit) != 0) {
+      fprintf(stderr,
+          "MYACCEL: warning: could not register early XRT cleanup\n");
+      return false;
+    }
+    return true;
+  }();
+  (void)cleanupRegistered;
   fprintf(stderr, "MYACCEL: loaded xclbin in %.3f ms\n",
       milliseconds(start, Clock::now()));
   return g_ctx.get();
@@ -289,17 +303,18 @@ extern "C" int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
 }
 
 extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
-    int32_t *accumulator, int n_size, int c_size, int h_size,
+    const int32_t *bias, int8_t *y, int n_size, int c_size, int h_size,
     int input_w_size, int m_size, int kh_size, int kw_size, int oh_size,
     int ow_size, int dilation_h, int dilation_w, int c_per_group, int group,
-    int pad_left, int pad_top, int stride_h, int stride_w,
-    int x_zero_point, int w_zero_point) {
+    int pad_left, int pad_top, int stride_h, int stride_w, int x_zero_point,
+    int w_zero_point, uint32_t requant_multiplier_bits,
+    int output_zero_point) {
   try {
     const bool profile = envFlagEnabled("MYACCEL_PROFILE");
     const bool useBufferPool =
         !envFlagEnabled("MYACCEL_DISABLE_BO_POOL");
     const auto totalStart = Clock::now();
-    if (!x || !weight || !accumulator || n_size <= 0 || c_size <= 0 ||
+    if (!x || !weight || !bias || !y || n_size <= 0 || c_size <= 0 ||
         h_size <= 0 || input_w_size <= 0 || m_size <= 0 || oh_size <= 0 ||
         ow_size <= 0)
       return 0;
@@ -342,8 +357,8 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
         (size_t)n_size * c_size * h_size * input_w_size * sizeof(int8_t);
     size_t wBytes = (size_t)m_size * c_per_group * kh_size * kw_size *
                     sizeof(int8_t);
-    size_t yBytes =
-        (size_t)n_size * m_size * oh_size * ow_size * sizeof(int32_t);
+    size_t bBytes = (size_t)m_size * sizeof(int32_t);
+    size_t yBytes = (size_t)n_size * m_size * oh_size * ow_size * sizeof(int8_t);
 
     const auto queueStart = Clock::now();
     std::lock_guard<std::mutex> executionLock(ctx->executionMutex);
@@ -365,12 +380,15 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
       allocationMask |= 1;
     if (buffers.weight.ensure(ctx->device, wBytes, kernel->group_id(1)))
       allocationMask |= 2;
-    if (buffers.output.ensure(ctx->device, yBytes, kernel->group_id(2)))
+    if (buffers.bias.ensure(ctx->device, bBytes, kernel->group_id(2)))
       allocationMask |= 4;
+    if (buffers.output.ensure(ctx->device, yBytes, kernel->group_id(3)))
+      allocationMask |= 8;
     const auto allocationEnd = Clock::now();
 
     xrt::bo &xBo = buffers.input.get();
     xrt::bo &wBo = buffers.weight.get();
+    xrt::bo &bBo = buffers.bias.get();
     xrt::bo &yBo = buffers.output.get();
 
     const auto xWriteStart = Clock::now();
@@ -379,6 +397,9 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
     const auto wWriteStart = Clock::now();
     wBo.write(weight, wBytes, 0);
     const auto wWriteEnd = Clock::now();
+    const auto bWriteStart = Clock::now();
+    bBo.write(bias, bBytes, 0);
+    const auto bWriteEnd = Clock::now();
 
     const auto xSyncStart = Clock::now();
     xBo.sync(XCL_BO_SYNC_BO_TO_DEVICE, xBytes, 0);
@@ -386,22 +407,27 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
     const auto wSyncStart = Clock::now();
     wBo.sync(XCL_BO_SYNC_BO_TO_DEVICE, wBytes, 0);
     const auto wSyncEnd = Clock::now();
+    const auto bSyncStart = Clock::now();
+    bBo.sync(XCL_BO_SYNC_BO_TO_DEVICE, bBytes, 0);
+    const auto bSyncEnd = Clock::now();
 
     const auto submitStart = Clock::now();
     Clock::time_point submitEnd;
     Clock::time_point waitStart;
     Clock::time_point waitEnd;
     if (kh_size == 1) {
-      auto run = (*kernel)(xBo, wBo, yBo, n_size, c_size, h_size,
-          input_w_size, m_size, x_zero_point, w_zero_point);
+      auto run = (*kernel)(xBo, wBo, bBo, yBo, n_size, c_size, h_size,
+          input_w_size, m_size, x_zero_point, w_zero_point,
+          requant_multiplier_bits, output_zero_point);
       submitEnd = Clock::now();
       waitStart = Clock::now();
       run.wait();
       waitEnd = Clock::now();
     } else {
-      auto run = (*kernel)(xBo, wBo, yBo, n_size, c_size, h_size,
-          input_w_size, m_size, oh_size, ow_size, pad_left, pad_top,
-          stride_h, stride_w, x_zero_point, w_zero_point);
+      auto run = (*kernel)(xBo, wBo, bBo, yBo, n_size, c_size, h_size,
+          input_w_size, m_size, oh_size, ow_size, pad_left, pad_top, stride_h,
+          stride_w, x_zero_point, w_zero_point, requant_multiplier_bits,
+          output_zero_point);
       submitEnd = Clock::now();
       waitStart = Clock::now();
       run.wait();
@@ -412,20 +438,21 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
     yBo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, yBytes, 0);
     const auto ySyncEnd = Clock::now();
     const auto readStart = Clock::now();
-    yBo.read(accumulator, yBytes, 0);
+    yBo.read(y, yBytes, 0);
     const auto readEnd = Clock::now();
 
     if (profile) {
       fprintf(stderr,
           "MYACCEL_PROFILE kernel=%s "
           "shape=%dx%dx%dx%d->%dx%dx%d kernel_shape=%dx%d "
-          "bytes=x:%zu,w:%zu,y:%zu pool=%s alloc_mask=0x%x "
+          "bytes=x:%zu,w:%zu,b:%zu,y:%zu pool=%s alloc_mask=0x%x "
           "context=%.3f queue=%.3f kernel_open=%.3f alloc=%.3f "
-          "x_write=%.3f w_write=%.3f x_sync=%.3f w_sync=%.3f "
+          "x_write=%.3f w_write=%.3f b_write=%.3f "
+          "x_sync=%.3f w_sync=%.3f b_sync=%.3f "
           "submit=%.3f wait=%.3f kernel_total=%.3f "
           "y_sync=%.3f read=%.3f total=%.3f ms\n",
           kernelName, n_size, c_size, h_size, input_w_size, m_size, oh_size,
-          ow_size, kh_size, kw_size, xBytes, wBytes, yBytes,
+          ow_size, kh_size, kw_size, xBytes, wBytes, bBytes, yBytes,
           useBufferPool ? "on" : "off", allocationMask,
           milliseconds(contextStart, contextEnd),
           milliseconds(queueStart, queueEnd),
@@ -433,8 +460,10 @@ extern "C" int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
           milliseconds(allocationStart, allocationEnd),
           milliseconds(xWriteStart, xWriteEnd),
           milliseconds(wWriteStart, wWriteEnd),
+          milliseconds(bWriteStart, bWriteEnd),
           milliseconds(xSyncStart, xSyncEnd),
           milliseconds(wSyncStart, wSyncEnd),
+          milliseconds(bSyncStart, bSyncEnd),
           milliseconds(submitStart, submitEnd),
           milliseconds(waitStart, waitEnd),
           milliseconds(submitStart, waitEnd),

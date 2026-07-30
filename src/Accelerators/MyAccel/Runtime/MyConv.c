@@ -249,8 +249,9 @@ static int check_i8_support(const int64_t *xs, const int64_t *ws,
       read_nonnegative_env_i64("MYACCEL_MAX_IO_BYTES", 32 * 1024 * 1024);
   const uint64_t xBytes = tensor_elems_4d(xs) * sizeof(int8_t);
   const uint64_t wBytes = tensor_elems_4d(ws) * sizeof(int8_t);
-  const uint64_t yBytes = tensor_elems_4d(ys) * sizeof(int32_t);
-  const uint64_t totalBytes = xBytes + wBytes + yBytes;
+  const uint64_t bBytes = (uint64_t)ws[0] * sizeof(int32_t);
+  const uint64_t yBytes = tensor_elems_4d(ys) * sizeof(int8_t);
+  const uint64_t totalBytes = xBytes + wBytes + bBytes + yBytes;
   if (maxIoBytes > 0 && totalBytes > (uint64_t)maxIoBytes) {
     snprintf(reason, reasonSize,
         "total INT8 accelerator IO bytes %llu exceeds "
@@ -259,6 +260,42 @@ static int check_i8_support(const int64_t *xs, const int64_t *ws,
     return 0;
   }
 
+  set_reason(reason, reasonSize, "supported");
+  return 1;
+}
+
+static int prepare_i8_hardware_requantization(float productScale,
+    float biasScale, int32_t biasZeroPoint, float outputScale,
+    uint32_t *requantMultiplierBits, char *reason, size_t reasonSize) {
+  if (!isfinite(productScale) || productScale <= 0.0f ||
+      !isfinite(biasScale) || biasScale <= 0.0f ||
+      !isfinite(outputScale) || outputScale <= 0.0f) {
+    set_reason(reason, reasonSize,
+        "quantization scales must be positive and finite");
+    return 0;
+  }
+
+  const float scaleTolerance =
+      1.0e-6f * fmaxf(fabsf(productScale), fabsf(biasScale));
+  if (biasZeroPoint != 0 ||
+      fabsf(productScale - biasScale) > scaleTolerance) {
+    set_reason(reason, reasonSize,
+        "bias is not in zero-point-free accumulator scale");
+    return 0;
+  }
+
+  const float multiplier = productScale / outputScale;
+  uint32_t multiplierBits = 0;
+  memcpy(&multiplierBits, &multiplier, sizeof(multiplierBits));
+  const uint32_t exponent = (multiplierBits >> 23) & 0xffU;
+  if (!isfinite(multiplier) || multiplier <= 0.0f || exponent == 0 ||
+      exponent == 0xffU) {
+    set_reason(reason, reasonSize,
+        "requantization multiplier is not positive, finite, and normal");
+    return 0;
+  }
+
+  *requantMultiplierBits = multiplierBits;
   set_reason(reason, reasonSize, "supported");
   return 1;
 }
@@ -325,9 +362,9 @@ static int8_t requantize_i8(int32_t sum, int32_t bias, int32_t biasZeroPoint,
   return (int8_t)quantized;
 }
 
-// Compute a QDQ-wrapped INT8 convolution. Supported 1x1 and 3x3 layers send
-// only the centered INT8 dot products to XRT; bias and requantization stay on
-// the host. Other kernel sizes and CPU=1 use the host implementation below.
+// Compute a QDQ-wrapped INT8 convolution. Supported 1x1 and 3x3 QLinearConv
+// layers send the dot product, bias, and bit-exact INT8 requantization to XRT.
+// Other kernel sizes, general bias quantization, and CPU=1 use the host path.
 // NCHW input and OIHW weights are assumed.
 void my_conv_qdq_i8(OMTensor *yTensor, const OMTensor *xTensor,
     const OMTensor *xScaleTensor, const OMTensor *xZeroPointTensor,
@@ -380,52 +417,37 @@ void my_conv_qdq_i8(OMTensor *yTensor, const OMTensor *xTensor,
         (long long)sh, (long long)sw, directOneByOne);
 
   char reason[160];
-  if (check_i8_support(xs, ws, ys, dh, dw, group, sh, sw, padLeft, padTop,
-          reason, sizeof(reason))) {
-    const size_t accumulatorCount = (size_t)tensor_elems_4d(ys);
-    int32_t *accumulator =
-        (int32_t *)malloc(accumulatorCount * sizeof(int32_t));
-    if (accumulator) {
-      if (profile)
-        fprintf(stderr,
-            "MYACCEL_INT8 routing convolution dot products to XRT: %s\n",
-            reason);
-      const double xrtStart = now_seconds();
-      if (myaccel_xrt_conv2d_i8(x, w, accumulator, (int)nSize, (int)cSize,
-              (int)hSize, (int)wSize, (int)mSize, (int)khSize, (int)kwSize,
-              (int)ohSize, (int)owSize, (int)dh, (int)dw, (int)cPerGroup,
-              (int)group, (int)padLeft, (int)padTop, (int)sh, (int)sw,
-              (int)xZeroPoint, (int)wZeroPoint)) {
-        const double xrtEnd = now_seconds();
-        for (int64_t n = 0; n < nSize; ++n)
-          for (int64_t m = 0; m < mSize; ++m)
-            for (int64_t position = 0; position < spatialSize; ++position) {
-              const int64_t index =
-                  (n * mSize + m) * spatialSize + position;
-              y[index] = requantize_i8(accumulator[index], b ? b[m] : 0,
-                  bZeroPoint, productScale, bScale, yScale, yZeroPoint);
-            }
-        const double requantEnd = now_seconds();
-        free(accumulator);
-        if (profile)
-          fprintf(stderr,
-              "MYACCEL_INT8_PROFILE xrt_dot_products=%.6f "
-              "host_requantization=%.6f total=%.6f s\n",
-              xrtEnd - xrtStart, requantEnd - xrtEnd,
-              requantEnd - xrtStart);
-        return;
-      }
-      free(accumulator);
-      if (profile)
-        fprintf(stderr,
-            "MYACCEL_INT8 XRT path failed after %.6f s; using host "
-            "convolution\n",
-            now_seconds() - xrtStart);
-    } else if (profile) {
+  uint32_t requantMultiplierBits = 0;
+  const int shapeSupported = check_i8_support(xs, ws, ys, dh, dw, group, sh,
+      sw, padLeft, padTop, reason, sizeof(reason));
+  const int requantSupported =
+      shapeSupported && prepare_i8_hardware_requantization(productScale,
+                            bScale, bZeroPoint, yScale,
+                            &requantMultiplierBits, reason, sizeof(reason));
+  if (requantSupported) {
+    if (profile)
       fprintf(stderr,
-          "MYACCEL_INT8 could not allocate the host accumulator; using host "
-          "convolution\n");
+          "MYACCEL_INT8 routing convolution and requantization to XRT: %s\n",
+          reason);
+    const double xrtStart = now_seconds();
+    if (myaccel_xrt_conv2d_i8(x, w, b, y, (int)nSize, (int)cSize,
+            (int)hSize, (int)wSize, (int)mSize, (int)khSize, (int)kwSize,
+            (int)ohSize, (int)owSize, (int)dh, (int)dw, (int)cPerGroup,
+            (int)group, (int)padLeft, (int)padTop, (int)sh, (int)sw,
+            (int)xZeroPoint, (int)wZeroPoint, requantMultiplierBits,
+            (int)yZeroPoint)) {
+      const double xrtEnd = now_seconds();
+      if (profile)
+        fprintf(stderr,
+            "MYACCEL_INT8_PROFILE xrt_full_convolution=%.6f total=%.6f s\n",
+            xrtEnd - xrtStart, xrtEnd - xrtStart);
+      return;
     }
+    if (profile)
+      fprintf(stderr,
+          "MYACCEL_INT8 XRT path failed after %.6f s; using host "
+          "convolution\n",
+          now_seconds() - xrtStart);
   } else if (profile) {
     fprintf(stderr, "MYACCEL_INT8 routing convolution to host: %s\n", reason);
   }

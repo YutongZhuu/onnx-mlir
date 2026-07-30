@@ -250,7 +250,33 @@ struct Int8ConvCase {
   int stride;
   int xZeroPoint;
   int wZeroPoint;
+  uint32_t multiplierBits;
+  int outputZeroPoint;
 };
+
+float floatFromBits(uint32_t bits) {
+  float value;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+int8_t referenceRequantize(int32_t accumulator, int32_t bias,
+    uint32_t multiplierBits, int outputZeroPoint) {
+  // Preserve the production expression's two binary32 rounding points:
+  // int64 -> float, followed by the float multiplication. This is exactly
+  // nearbyintf((float)((int64)sum + bias) * multiplier) + output zero point.
+  const int64_t combined = (int64_t)accumulator + (int64_t)bias;
+  volatile float accumulatorFloat = (float)combined;
+  volatile float multiplier = floatFromBits(multiplierBits);
+  volatile float product = accumulatorFloat * multiplier;
+  const int64_t shifted =
+      (int64_t)::nearbyintf(product) + (int64_t)outputZeroPoint;
+  if (shifted < -128)
+    return (int8_t)-128;
+  if (shifted > 127)
+    return (int8_t)127;
+  return (int8_t)shifted;
+}
 
 bool runInt8Case(xrt::device &device, xrt::kernel &kernel,
     const Int8ConvCase &test, std::mt19937 &generator,
@@ -266,17 +292,22 @@ bool runInt8Case(xrt::device &device, xrt::kernel &kernel,
       (size_t)test.n * test.m * ohSize * owSize;
   const size_t xBytes = xCount * sizeof(int8_t);
   const size_t weightBytes = weightCount * sizeof(int8_t);
-  const size_t outputBytes = outputCount * sizeof(int32_t);
+  const size_t biasBytes = (size_t)test.m * sizeof(int32_t);
+  const size_t outputBytes = outputCount * sizeof(int8_t);
 
   std::uniform_int_distribution<int> distribution(-128, 127);
+  std::uniform_int_distribution<int32_t> biasDistribution(-10000, 10000);
   std::vector<int8_t> x(xCount);
   std::vector<int8_t> weight(weightCount);
-  std::vector<int32_t> expected(outputCount);
-  std::vector<int32_t> actual(outputCount, INT32_MIN);
+  std::vector<int32_t> bias(test.m);
+  std::vector<int8_t> expected(outputCount);
+  std::vector<int8_t> actual(outputCount, 0);
   for (int8_t &value : x)
     value = (int8_t)distribution(generator);
   for (int8_t &value : weight)
     value = (int8_t)distribution(generator);
+  for (int32_t &value : bias)
+    value = biasDistribution(generator);
 
   for (int n = 0; n < test.n; ++n)
     for (int m = 0; m < test.m; ++m)
@@ -305,37 +336,43 @@ bool runInt8Case(xrt::device &device, xrt::kernel &kernel,
           const size_t outputIndex =
               ((size_t)n * test.m + m) * ohSize * owSize +
               (size_t)oh * owSize + ow;
-          expected[outputIndex] = sum;
+          expected[outputIndex] = referenceRequantize(sum, bias[m],
+              test.multiplierBits, test.outputZeroPoint);
         }
 
   const auto allocationStart = Clock::now();
   xrt::bo xBo(device, xBytes, kernel.group_id(0));
   xrt::bo weightBo(device, weightBytes, kernel.group_id(1));
-  xrt::bo outputBo(device, outputBytes, kernel.group_id(2));
+  xrt::bo biasBo(device, biasBytes, kernel.group_id(2));
+  xrt::bo outputBo(device, outputBytes, kernel.group_id(3));
   const auto allocationEnd = Clock::now();
 
   const auto writeStart = Clock::now();
   xBo.write(x.data(), xBytes, 0);
   weightBo.write(weight.data(), weightBytes, 0);
+  biasBo.write(bias.data(), biasBytes, 0);
   const auto writeEnd = Clock::now();
 
   const auto h2dStart = Clock::now();
   xBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   weightBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  biasBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   const auto h2dEnd = Clock::now();
 
   const auto waitStart = Clock::now();
   ert_cmd_state state;
   if (test.kernel == 1) {
-    auto run = kernel(xBo, weightBo, outputBo, test.n, test.c, test.h, test.w,
-        test.m, test.xZeroPoint, test.wZeroPoint);
+    auto run = kernel(xBo, weightBo, biasBo, outputBo, test.n, test.c, test.h,
+        test.w, test.m, test.xZeroPoint, test.wZeroPoint,
+        test.multiplierBits, test.outputZeroPoint);
     state = run.wait(runTimeoutMs);
     if (state == ERT_CMD_STATE_TIMEOUT)
       (void)run.abort();
   } else {
-    auto run = kernel(xBo, weightBo, outputBo, test.n, test.c, test.h, test.w,
-        test.m, ohSize, owSize, test.pad, test.pad, test.stride, test.stride,
-        test.xZeroPoint, test.wZeroPoint);
+    auto run = kernel(xBo, weightBo, biasBo, outputBo, test.n, test.c, test.h,
+        test.w, test.m, ohSize, owSize, test.pad, test.pad, test.stride,
+        test.stride, test.xZeroPoint, test.wZeroPoint, test.multiplierBits,
+        test.outputZeroPoint);
     state = run.wait(runTimeoutMs);
     if (state == ERT_CMD_STATE_TIMEOUT)
       (void)run.abort();
@@ -357,16 +394,18 @@ bool runInt8Case(xrt::device &device, xrt::kernel &kernel,
   for (size_t i = 0; i < outputCount; ++i) {
     if (actual[i] != expected[i]) {
       std::fprintf(stderr, "FAIL %s at %zu: expected %d, got %d\n",
-          test.name, i, expected[i], actual[i]);
+          test.name, i, (int)expected[i], (int)actual[i]);
       return false;
     }
   }
 
   std::printf(
-      "PASS %s exact_int32_outputs=%zu\n"
+      "PASS %s exact_int8_outputs=%zu multiplier_bits=0x%08x "
+      "output_zero_point=%d\n"
       "  bo_alloc=%8.3f ms  host_write=%8.3f ms  h2d_sync=%8.3f ms\n"
       "  run_wait=%8.3f ms  d2h_sync=%8.3f ms  host_read=%8.3f ms\n",
-      test.name, outputCount, milliseconds(allocationStart, allocationEnd),
+      test.name, outputCount, test.multiplierBits, test.outputZeroPoint,
+      milliseconds(allocationStart, allocationEnd),
       milliseconds(writeStart, writeEnd), milliseconds(h2dStart, h2dEnd),
       milliseconds(waitStart, waitEnd), milliseconds(d2hStart, d2hEnd),
       milliseconds(readStart, readEnd));
@@ -453,7 +492,8 @@ int main(int argc, char **argv) {
     if (runInt8_1x1) {
       xrt::kernel kernel(device, uuid, "conv1x1_i8_kernel");
       const Int8ConvCase test = {
-          "conv1x1_i8_kernel", 1, 5, 4, 7, 17, 1, 0, 1, -7, 11};
+          "conv1x1_i8_kernel", 1, 5, 4, 7, 17, 1, 0, 1, -7, 11,
+          0x3b000000U, -9};
       passed = runInt8Case(
                    device, kernel, test, generator, runTimeoutMs) &&
           passed;
@@ -461,7 +501,8 @@ int main(int argc, char **argv) {
     if (runInt8_3x3) {
       xrt::kernel kernel(device, uuid, "conv3x3_i8_kernel");
       const Int8ConvCase test = {
-          "conv3x3_i8_kernel", 1, 5, 7, 6, 17, 3, 1, 2, -7, 11};
+          "conv3x3_i8_kernel", 1, 5, 7, 6, 17, 3, 1, 2, -7, 11,
+          0x39800000U, 13};
       passed = runInt8Case(
                    device, kernel, test, generator, runTimeoutMs) &&
           passed;
